@@ -1,0 +1,115 @@
+{
+  "neurojico": {
+    "seed": 42,
+    "margin": 0.25,
+    "label_confidence": 0.8,
+    "alpha": 0.1,
+    "folds": 5,
+    "calibration_fraction": 0.2,
+    "inner_validation_fraction": 0.2,
+    "review_budget": 100,
+    "bootstrap": 300,
+    "gap_bp": 250000,
+    "backbone": {
+      "name": "alphagenome",
+      "client": "alphagenome",
+      "api_env_var": "ALPHA_GENOME_API_KEY",
+      "sequence_length_bp": 1048576,
+      "organism": "HOMO_SAPIENS",
+      "requested_outputs": ["RNA_SEQ", "CAGE", "DNASE", "ATAC", "CHIP_TF"],
+      "status": "AlphaGenome API (Avsec et al., Nature 2026); free non-commercial use. Provenance via per-response SHA-256 cached under output/experiments/neurojico/alphagenome_cache/."
+    },
+    "secondary": {
+      "name": "decima",
+      "pypi_package": "decima",
+      "model_identifier": "ensemble",
+      "device": "cpu",
+      "weights_source": "Zenodo 15092691 (fetched automatically by decima.hub.load_decima_model via HuggingFace)",
+      "status": "Decima (Genentech 2026); frozen inference-only, ensemble weights downloaded on first use and cached by Decima/HF."
+    },
+    "cell_states": {
+      "primary_T": {
+        "label": "primary CD4+ T cell",
+        "ontology_curies": ["CL:0000624", "CL:0000895", "CL:0000897"],
+        "direct_hit_curies": ["CL:0000624"],
+        "proxy_hit_curies": ["CL:0000895", "CL:0000897"],
+        "note": "Direct hit: CL:0000624 'CD4-positive, alpha-beta T cell' (bulk CD4+ alpha-beta T). Proxies: CL:0000895 (naive thymus-derived CD4+ alpha-beta T) and CL:0000897 (CD4+ alpha-beta memory T) together span the CD4+ compartment that donor PBMC CD4+ magnetic-bead enrichment yields, matching the Ho 2025 sort. Treg (CL:0000792) and effector subsets (CL:0000904/0905/1044) are intentionally excluded as specialized lineages. CL:0000492 'CD4+ helper T cell' is biologically meaningful but AlphaGenome does not publish tracks under it; validated against the live catalog on 2026-10-20 via scripts/validate_alphagenome_ontology.py."
+      },
+      "jurkat": {
+        "label": "Jurkat T lymphoblast cell line",
+        "ontology_curies": ["EFO:0002796", "CLO:0007045"],
+        "direct_hit_curies": ["EFO:0002796", "CLO:0007045"],
+        "proxy_hit_curies": [],
+        "note": "EFO:0002796 is 'Jurkat' in EFO; CLO:0007045 is 'Jurkat, Clone E6-1', the ATCC clone used in Siraj 2026 and other Jurkat screens. Both are direct hits for the Jurkat cell line; no proxy is biologically appropriate for an immortalized leukemic T-cell line. The previously declared EFO:0001083 and CL:0000912 are not in AlphaGenome's catalog (verified via scripts/validate_alphagenome_ontology.py on 2026-10-20)."
+      }
+    },
+    "verify_ontology_terms_on_first_call": true,
+    "fusion": {
+      "alphagenome_track_outputs": ["RNA_SEQ", "CAGE", "DNASE", "ATAC", "CHIP_TF"],
+      "ho_mechanistic_fields": [
+        "delta_svm_nCD4",
+        "motifbreakr_tcell_alleleDiff_max",
+        "motifbreakr_tcell_alleleDiff_min",
+        "motifbreakr_jurkat_alleleDiff_max",
+        "motifbreakr_jurkat_alleleDiff_min",
+        "motifbreakr_tcell_tf_count",
+        "motifbreakr_jurkat_tf_count"
+      ],
+      "dhs_fields": ["dhs_hTH1", "dhs_hTH17", "dhs_hTH2", "dhs_CD4", "dhs_CD4pos_N",
+                     "dhs_hTR", "dhs_Jurkat", "dhs_CD8"]
+    },
+    "head": {
+      "ridge_alpha": 10.0
+    },
+    "uncertainty_baselines": {
+      "degu_ensemble_members": 5,
+      "conformal_knn": 25,
+      "calibration_fraction_within_fit_fold": 0.2
+    },
+    "rough": {
+      "neighbors": 25,
+      "beta": 0.65,
+      "lower_threshold": 0.8,
+      "upper_threshold": 0.1
+    },
+    "rough_soft_ai_rejected_variant_value": {
+      "semantics": "use_source_effect",
+      "note": "Rough-soft AI must output a number for every held-out variant. For variants where the VPRS lower approximation is empty (model declines), we define the Rough-soft AI prediction to equal the source-context effect (Jurkat), i.e. 'no evidence of a cell-type change'. This is a definition of the Rough-soft AI method, not an error fallback."
+    },
+    "tuning": {
+      "beta_grid": [0.55, 0.6, 0.65, 0.7, 0.75]
+    },
+    "expert_actions": {
+      "accept": {"semantics": "keep_ai", "constant_value": null},
+      "challenge": {"semantics": "use_source_effect", "constant_value": null},
+      "defer": {"semantics": "constant", "constant_value": 0.0}
+    },
+    "evaluation": {
+      "development_dataset": "siraj",
+      "held_out_datasets": ["ho", "bourges"],
+      "overlap_file": "data/regulatory_audit/ho_bourges_shared_rsids.txt",
+      "selectors": ["vprs_lower_support", "ordinary_neighbor_support",
+                    "degu_style_ensemble_disagreement", "representation_distance",
+                    "split_conformal", "random"],
+      "coverage_grid": [0.1, 0.25, 0.5, 0.75, 1.0],
+      "four_methods": ["ai_alone", "rough_soft_ai", "expert_alone", "neurojico"],
+      "expert_review_seconds_per_card": 90.0,
+      "expert_alone_selection_rule": "largest_abs_ai_prediction",
+      "expert_alone_selection_rule_choices": ["random", "largest_abs_ai_prediction", "largest_source_se"],
+      "expert_alone_selection_note": "Expert-alone selects its own B variants to review using a non-VPRS rule, so that the Expert-alone vs Neurojico comparison tests whether VPRS boundary selection beats a reasonable uncertainty-blind selection rule under the same reviewed-variant budget."
+    }
+  },
+  "biological_rules": {
+    "version": "1.0",
+    "margin": 0.25,
+    "z_measurement": 1.96,
+    "sources": {
+      "Ho2025": {"title": "Genetic and epigenetic screens in primary human T cells", "doi": "10.1038/s41588-025-02301-3"},
+      "Siraj2026": {"title": "Functional dissection of complex trait variants at single-nucleotide resolution", "doi": "10.1038/s41586-026-10121-6"},
+      "Bourges2020": {"title": "Resting and activated primary T cell MPRA", "doi": "10.15252/emmm.202012112", "journal": "EMBO Molecular Medicine"},
+      "Avsec2026": {"title": "AlphaGenome", "doi": "10.1038/s41586-026-xxxxx"},
+      "Decima2026": {"title": "Decima: variant effects on gene expression from scRNA-seq", "doi": "10.1038/s41592-026-xxxxx"},
+      "Ziarko1993": {"title": "Variable precision rough set model", "doi": "10.1016/0022-0000(93)90048-2"}
+    }
+  }
+}
