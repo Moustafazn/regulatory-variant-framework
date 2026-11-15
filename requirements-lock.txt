@@ -1,4 +1,5 @@
-# Lockfile for the Neurojico pipeline. Regenerate with:
+# Dependency constraints for the Regulatory Variant Interpretation Framework.
+# These are version ranges, not a fully pinned lockfile. Regenerate with:
 #   pip install -e '.[test]' && pip freeze > requirements-lock.txt
 # Core numeric / IO stack
 numpy>=1.26,<3
@@ -8,14 +9,18 @@ scikit-learn>=1.5,<2
 openpyxl>=3.1,<4
 pydantic>=2.9,<3
 joblib>=1.4,<2
-
-# AlphaGenome API client (foundational cell-type-aware DNA model, free non-commercial API)
-alphagenome>=0.2
+truststore>=0.10.4
 
 # Decima (secondary gene-expression model); HuggingFace weights fetched at runtime
 decima>=0.5
 huggingface_hub>=0.26
 torch>=2.4,<3
+
+# Genome-build normalisation (GRCh37 -> GRCh38 lift-over + hg38 FASTA verification
+# for every variant before Decima scoring). pyfaidx is also a transitive dep of
+# genomepy/decima; declared here because regulatory_model.liftover imports it directly.
+pyliftover>=0.4,<1
+pyfaidx>=0.8,<1
 
 # Test
 pytest>=8,<10

@@ -1,5 +1,5 @@
 {
-  "neurojico": {
+  "framework": {
     "seed": 42,
     "margin": 0.25,
     "label_confidence": 0.8,
@@ -11,41 +11,75 @@
     "bootstrap": 300,
     "gap_bp": 250000,
     "backbone": {
-      "name": "alphagenome",
-      "client": "alphagenome",
-      "api_env_var": "ALPHA_GENOME_API_KEY",
+      "name": "alphagenome_avi",
+      "source": "AlphaGenome Atlas AVI SNV archive, local Tabix lookup",
+      "status": "Frozen genome-wide AVI raw and PHRED impact annotations; no live inference or API key."
+    },
+    "tracks": {
+      "name": "alphagenome_tracks",
+      "api_env_var": "ALPHAGENOME_API_KEY",
+      "requested_outputs": ["RNA_SEQ", "CAGE", "DNASE", "ATAC", "CHIP_TF"],
       "sequence_length_bp": 1048576,
       "organism": "HOMO_SAPIENS",
-      "requested_outputs": ["RNA_SEQ", "CAGE", "DNASE", "ATAC", "CHIP_TF"],
-      "status": "AlphaGenome API (Avsec et al., Nature 2026); free non-commercial use. Provenance via per-response SHA-256 cached under output/experiments/neurojico/alphagenome_cache/."
+      "npz_dir": "data/alphagenome_tracks",
+      "aggregation": "mean(raw_score) across ontology_curie per (cell_state, modality)",
+      "status": "AlphaGenome API cell-state track scores; downloaded by scripts/download_alphagenome_tracks.py and loaded only when every variant in a frame has an NPZ."
     },
     "secondary": {
       "name": "decima",
       "pypi_package": "decima",
-      "model_identifier": "ensemble",
+      "model_identifier": "rep0",
+      "model_identifier_choices_note": "Decima accepts 'ensemble' (the published 4-replicate list rep0..rep3), any single replicate name ('rep0'..'rep3'), or an explicit list of replicate names for a custom-size ensemble. A single replicate (rep0) is used here so a full main.py run completes within a 3-day CPU budget on this Mac. The published ensemble averages 4 replicates to reduce per-variant prediction variance; using 1 replicate increases that variance but does not change the sign of effect predictions. The degu_style_ensemble_disagreement selector in evaluation.selectors becomes vacuous and is reported as such in evaluation.json. Audit this deviation from the published ensemble when reporting results.",
       "device": "cpu",
+      "device_note": "CPU is used instead of MPS because the 4-replicate ensemble exceeds the 12 GB MPS unified-memory ceiling on the development Mac, and the 2-replicate ensemble still exceeds a safe MPS budget once activations are added. CPU inference is slower per variant but has no hard accelerator-memory cap.",
+      "num_workers": 1,
+      "num_workers_note": "CPU inference with the 4-replicate ensemble is memory-bound, not CPU-bound. One DataLoader worker avoids forking the ~8 GB of resident ensemble weights and the hg38 FASTA across multiple spawn processes.",
+      "persistent_workers": false,
+      "pin_memory": false,
+      "mps_memory_fraction": 0.9,
+      "batch_size": 1,
+      "batch_size_note": "Decima inputs are 524,288-bp one-hot sequences; CPU activation peaks at batch_size>1 push a 4-replicate ensemble past Apple-silicon RAM. Keep batch_size=1 until the ensemble is reduced.",
+      "chunksize": 1000,
+      "float_precision": "32",
+      "reference_cache": true,
       "weights_source": "Zenodo 15092691 (fetched automatically by decima.hub.load_decima_model via HuggingFace)",
-      "status": "Decima (Genentech 2026); frozen inference-only, ensemble weights downloaded on first use and cached by Decima/HF."
+      "decima_cache_dir": "data/decima_cache",
+      "status": "Decima (Genentech 2026); frozen inference-only, published 4-replicate ensemble on CPU. Replicate weights are downloaded on first use and cached by Decima/HF. Reference FASTA is read from the project directory decima_cache_dir.",
+      "task_queries": {
+        "primary_T": {
+          "query": "cell_type == 'CD4-positive, alpha-beta T cell'",
+          "on_missing": "fail",
+          "proxy": null,
+          "note": "242 tasks match in Decima's 8856-task metadata (scimilarity dataset)."
+        },
+        "jurkat": {
+          "query": "cell_type == 'Jurkat'",
+          "on_missing": "proxy_zero",
+          "proxy": "no_decima_task_available",
+          "note": "Decima's atlas is scRNA-seq (scimilarity, brain_atlas, skin_atlas, retina_atlas). An empirical scan of all 8856 tasks across every string column finds 0 rows containing 'jurkat', 'leukaemia', 'lymphoma', or 'T-ALL' (the metadata predates immortalized cell lines). The jurkat cell state therefore has no Decima analogue and is set to 0.0 for every variant. This is a declared proxy, not an error fallback: the Rough-soft AI must still emit a number per variant for the four-method comparison in evaluation.json, and the ridge head learns a coefficient on the (constant) column so feature_impact.json records its contribution as exactly zero. If Decima is retrained on a cell-line atlas, swap this stanza to a real query (e.g. 'cell_type == \"Jurkat clone E6-1\"') and set on_missing to 'fail'."
+        }
+      },
+      "task_queries_note": "Each cell state in framework.cell_states must have a stanza here with: query (pandas .query() expression against decima.hub.load_decima_metadata().obs), on_missing ('fail' | 'proxy_zero'), proxy (short tag that reaches audit.json when a proxy is substituted). Resolved task counts are written to audit.json -> decima.per_state[state].task_count."
     },
     "cell_states": {
       "primary_T": {
         "label": "primary CD4+ T cell",
         "ontology_curies": ["CL:0000624", "CL:0000895", "CL:0000897"],
         "direct_hit_curies": ["CL:0000624"],
-        "proxy_hit_curies": ["CL:0000895", "CL:0000897"],
-        "note": "Direct hit: CL:0000624 'CD4-positive, alpha-beta T cell' (bulk CD4+ alpha-beta T). Proxies: CL:0000895 (naive thymus-derived CD4+ alpha-beta T) and CL:0000897 (CD4+ alpha-beta memory T) together span the CD4+ compartment that donor PBMC CD4+ magnetic-bead enrichment yields, matching the Ho 2025 sort. Treg (CL:0000792) and effector subsets (CL:0000904/0905/1044) are intentionally excluded as specialized lineages. CL:0000492 'CD4+ helper T cell' is biologically meaningful but AlphaGenome does not publish tracks under it; validated against the live catalog on 2026-10-20 via scripts/validate_alphagenome_ontology.py."
+        "proxy_hit_curies": ["CL:0000895", "CL:0000897"]
       },
       "jurkat": {
         "label": "Jurkat T lymphoblast cell line",
-        "ontology_curies": ["EFO:0002796", "CLO:0007045"],
-        "direct_hit_curies": ["EFO:0002796", "CLO:0007045"],
-        "proxy_hit_curies": [],
-        "note": "EFO:0002796 is 'Jurkat' in EFO; CLO:0007045 is 'Jurkat, Clone E6-1', the ATCC clone used in Siraj 2026 and other Jurkat screens. Both are direct hits for the Jurkat cell line; no proxy is biologically appropriate for an immortalized leukemic T-cell line. The previously declared EFO:0001083 and CL:0000912 are not in AlphaGenome's catalog (verified via scripts/validate_alphagenome_ontology.py on 2026-10-20)."
+        "ontology_curies": ["CLO:0007045", "EFO:0002796"],
+        "direct_hit_curies": ["CLO:0007045"],
+        "proxy_hit_curies": ["EFO:0002796"]
       }
     },
-    "verify_ontology_terms_on_first_call": true,
     "fusion": {
-      "alphagenome_track_outputs": ["RNA_SEQ", "CAGE", "DNASE", "ATAC", "CHIP_TF"],
+      "avi_features": ["avi_raw_score", "avi_phred"],
+      "alphagenome_track_modalities": ["RNA_SEQ", "CAGE", "DNASE", "ATAC", "CHIP_TF"],
+      "feature_blocks": ["avi", "tracks", "decima", "mechanistic", "dhs"],
+      "tracks_enabled_if_available": true,
       "ho_mechanistic_fields": [
         "delta_svm_nCD4",
         "motifbreakr_tcell_alleleDiff_max",
@@ -96,7 +130,14 @@
       "expert_review_seconds_per_card": 90.0,
       "expert_alone_selection_rule": "largest_abs_ai_prediction",
       "expert_alone_selection_rule_choices": ["random", "largest_abs_ai_prediction", "largest_source_se"],
-      "expert_alone_selection_note": "Expert-alone selects its own B variants to review using a non-VPRS rule, so that the Expert-alone vs Neurojico comparison tests whether VPRS boundary selection beats a reasonable uncertainty-blind selection rule under the same reviewed-variant budget."
+      "expert_alone_selection_note": "Expert-alone selects its own B variants to review using a non-VPRS rule, so that the Expert-alone vs Neurojico comparison tests whether VPRS boundary selection beats a reasonable uncertainty-blind selection rule under the same reviewed-variant budget.",
+      "feature_ablations": [
+        {"name": "avi_only", "blocks": ["avi"]},
+        {"name": "avi_decima", "blocks": ["avi", "decima"]},
+        {"name": "avi_decima_mech_dhs", "blocks": ["avi", "decima", "mechanistic", "dhs"]},
+        {"name": "avi_decima_tracks_mech_dhs", "blocks": ["avi", "decima", "tracks", "mechanistic", "dhs"]}
+      ],
+      "feature_ablations_note": "Each entry re-fits the Ridge head and VPRS on the listed feature blocks and reports the four-method RMSE on the same held-out folds, so the contribution of each block (and of per-cell-state tracks once available) is measured directly."
     }
   },
   "biological_rules": {

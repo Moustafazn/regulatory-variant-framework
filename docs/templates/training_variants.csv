@@ -1,0 +1,1 @@
+example_id,variant_id,chrom,position,genome_build,ref,alt,avi_raw_score,avi_phred,source_context,target_context,source_effect,source_se,target_effect,target_se,effect_covariance

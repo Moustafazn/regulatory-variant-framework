@@ -1,7 +1,8 @@
 [project]
-name = "neurojico-rough-set"
+name = "regulatory-variant-framework"
 version = "1.0.0"
-description = "Human-AI augmented regulatory variant interpretation using AlphaGenome + Decima + rough-soft uncertainty"
+description = "Context-dependent regulatory variant interpretation with integrated molecular evidence, uncertainty, and expert review"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "numpy>=1.26,<3",
@@ -11,19 +12,31 @@ dependencies = [
   "openpyxl>=3.1,<4",
   "pydantic>=2.9,<3",
   "joblib>=1.4,<2",
+  "truststore>=0.10.4",
   # Foundational models
-  "alphagenome>=0.2",
   "huggingface_hub>=0.26",
   "torch>=2.4,<3",
   # Decima (installed from PyPI as decima; HF weights downloaded at runtime)
   "decima>=0.5",
+  # Genome-build normalisation (GRCh37 -> GRCh38 lift-over + hg38 FASTA verification
+  # for every variant before Decima scoring). pyfaidx is also a transitive dep of
+  # genomepy/decima; declared here because regulatory_model.liftover imports it directly.
+  "pyliftover>=0.4,<1",
+  "pyfaidx>=0.8,<1",
 ]
 
 [project.optional-dependencies]
 test = ["pytest>=8,<10"]
+alphagenome = ["alphagenome>=0.7"]
 
 [project.scripts]
+regulatory-variants = "main:main"
+# Compatibility command for existing workflows.
 neurojico = "main:main"
+
+[project.urls]
+Repository = "https://github.com/Moustafazn/regulatory-variant-framework"
+Issues = "https://github.com/Moustafazn/regulatory-variant-framework/issues"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -35,6 +48,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["regulatory_model*"]
+
+[tool.setuptools]
+py-modules = ["main"]
 
 [tool.setuptools.package-data]
 regulatory_model = ["config.json"]

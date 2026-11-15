@@ -1,7 +1,7 @@
 """Ziarko variable-precision rough-soft set (box 3) and mechanistic feature fusion.
 
-The AI predictor (box 2 of the Neurojico figure) is the frozen AlphaGenome + Decima
-score pipeline implemented in ``training.py``. This module only contains the
+The AI predictor (prediction stage of the framework) combines local AlphaGenome AVI
+annotations with Decima scores. This module contains the
 uncertainty wrapper (``VariablePrecisionRoughSoft``), a Ridge-based scalar head that
 converts fused representations into a scalar effect prediction, and ``MechanisticFusion``
 which concatenates the per-variant representation used by both the head and the VPRS.
@@ -66,39 +66,123 @@ class VariablePrecisionRoughSoft:
                 'distance': distances.mean(1), 'neighbor_indices': indices}
 
 
-class MechanisticFusion:
-    """Concatenate AlphaGenome track deltas, Decima gene deltas, Ho mechanistic predictors, DHS."""
+class FeatureBlock:
+    """biologically-meaningful block of the fused representation."""
 
-    def __init__(self, settings):
-        f = settings['fusion']
-        self.alphagenome_outputs = tuple(f['alphagenome_track_outputs'])
-        self.mechanistic_fields = tuple(f['ho_mechanistic_fields'])
-        self.dhs_fields = tuple(f['dhs_fields'])
-        self.cell_states = tuple(settings['cell_states'].keys())
-
-    def transform(self, alphagenome_scores, decima_scores, frame):
-        # Stack: [AlphaGenome deltas per cell_state x output] + [Decima deltas per cell_state] + [mechanistic] + [DHS].
-        blocks = []
-        column_names = []
-        for cell_state in self.cell_states:
-            for output in self.alphagenome_outputs:
-                key = f'{cell_state}:{output}'
-                vec = np.asarray(alphagenome_scores.get(key), dtype=float).reshape(len(frame), -1)
-                blocks.append(vec)
-                column_names.extend([f'ag:{key}:{i}' for i in range(vec.shape[1])])
-        for cell_state in self.cell_states:
-            vec = np.asarray(decima_scores.get(cell_state), dtype=float).reshape(len(frame), -1)
-            blocks.append(vec)
-            column_names.extend([f'decima:{cell_state}:{i}' for i in range(vec.shape[1])])
-        mech = frame.reindex(columns=self.mechanistic_fields).to_numpy(dtype=float, na_value=0.0)
-        blocks.append(mech)
-        column_names.extend([f'ho:{c}' for c in self.mechanistic_fields])
-        dhs = frame.reindex(columns=self.dhs_fields).to_numpy(dtype=float, na_value=0.0)
-        blocks.append(dhs)
-        column_names.extend([f'dhs:{c}' for c in self.dhs_fields])
-        matrix = np.concatenate(blocks, axis=1)
+    def __init__(self, name, column_names, builder, required_inputs=()):
+        self.name = name
         self.column_names = tuple(column_names)
+        self._builder = builder
+        self.required_inputs = tuple(required_inputs)
+
+    def build(self, frame, inputs):
+        missing = [key for key in self.required_inputs if inputs.get(key) is None]
+        if missing:
+            raise KeyError(f'Feature block {self.name!r} requires inputs {missing!r}.')
+        matrix = np.asarray(self._builder(frame, inputs), dtype=float)
+        if matrix.shape != (len(frame), len(self.column_names)):
+            raise ValueError(
+                f'Feature block {self.name!r} produced shape {matrix.shape}; '
+                f'expected ({len(frame)}, {len(self.column_names)}).'
+            )
         return matrix
+
+
+def _avi_block(settings):
+    features = tuple(settings['fusion']['avi_features'])
+    columns = [f'avi:{feature}' for feature in features]
+
+    def build(frame, inputs):
+        avi = inputs['avi']
+        return np.column_stack([
+            np.asarray(avi[feature], dtype=float).reshape(len(frame))
+            for feature in features
+        ])
+
+    return FeatureBlock('avi', columns, build, required_inputs=('avi',))
+
+
+def _tracks_block(settings):
+    cell_states = tuple(settings['cell_states'].keys())
+    modalities = tuple(settings['fusion'].get('alphagenome_track_modalities', ()))
+    columns = [f'tracks:{state}:{modality}' for state in cell_states for modality in modalities]
+
+    def build(frame, inputs):
+        tracks = inputs['tracks']
+        parts = []
+        for state in cell_states:
+            vec = np.asarray(tracks[state], dtype=float).reshape(len(frame), -1)
+            if vec.shape[1] != len(modalities):
+                raise ValueError(
+                    f'tracks[{state!r}] has {vec.shape[1]} modalities; '
+                    f'expected {len(modalities)} ({modalities}).'
+                )
+            parts.append(vec)
+        return np.concatenate(parts, axis=1)
+
+    return FeatureBlock('tracks', columns, build, required_inputs=('tracks',))
+
+
+def _decima_block(settings):
+    cell_states = tuple(settings['cell_states'].keys())
+    columns = [f'decima:{state}' for state in cell_states]
+
+    def build(frame, inputs):
+        decima = inputs['decima']
+        return np.column_stack([
+            np.asarray(decima[state], dtype=float).reshape(len(frame))
+            for state in cell_states
+        ])
+
+    return FeatureBlock('decima', columns, build, required_inputs=('decima',))
+
+
+def _mechanistic_block(settings):
+    fields = tuple(settings['fusion']['ho_mechanistic_fields'])
+    columns = [f'ho:{field}' for field in fields]
+
+    def build(frame, _inputs):
+        return frame.reindex(columns=fields).to_numpy(dtype=float, na_value=0.0)
+
+    return FeatureBlock('mechanistic', columns, build)
+
+
+def _dhs_block(settings):
+    fields = tuple(settings['fusion']['dhs_fields'])
+    columns = [f'dhs:{field}' for field in fields]
+
+    def build(frame, _inputs):
+        return frame.reindex(columns=fields).to_numpy(dtype=float, na_value=0.0)
+
+    return FeatureBlock('dhs', columns, build)
+
+
+FEATURE_BLOCK_FACTORIES = {
+    'avi': _avi_block,
+    'tracks': _tracks_block,
+    'decima': _decima_block,
+    'mechanistic': _mechanistic_block,
+    'dhs': _dhs_block,
+}
+
+
+class MechanisticFusion:
+    """Build the fused representation from an ordered registry of feature blocks."""
+
+    def __init__(self, settings, enabled_blocks=None):
+        order = tuple(settings['fusion'].get('feature_blocks',
+                                             ('avi', 'tracks', 'decima', 'mechanistic', 'dhs')))
+        enabled = set(enabled_blocks) if enabled_blocks is not None else set(order)
+        unknown = enabled - set(FEATURE_BLOCK_FACTORIES)
+        if unknown:
+            raise ValueError(f'Unknown feature blocks requested: {sorted(unknown)}')
+        self.blocks = [FEATURE_BLOCK_FACTORIES[name](settings) for name in order if name in enabled]
+        self.column_names = tuple(column for block in self.blocks for column in block.column_names)
+
+    def transform(self, avi_scores, decima_scores, frame, track_scores=None):
+        inputs = {'avi': avi_scores, 'decima': decima_scores, 'tracks': track_scores}
+        parts = [block.build(frame, inputs) for block in self.blocks]
+        return np.concatenate(parts, axis=1) if parts else np.zeros((len(frame), 0))
 
 
 class RidgeHead:

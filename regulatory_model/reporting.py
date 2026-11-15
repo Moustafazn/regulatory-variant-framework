@@ -39,29 +39,11 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def sha256_bytes(payload):
-    # Hash in-memory bytes used for API-response provenance.
-    return hashlib.sha256(payload).hexdigest()
-
-
-def sha256_directory(path):
-    # Deterministic SHA over sorted file hashes inside a model checkpoint directory.
-    path = Path(path)
-    files = sorted(p for p in path.rglob('*') if p.is_file())
-    digest = hashlib.sha256()
-    for file in files:
-        digest.update(file.relative_to(path).as_posix().encode())
-        digest.update(b'\x00')
-        digest.update(sha256(file).encode())
-        digest.update(b'\n')
-    return digest.hexdigest()
-
-
 def platform_metadata():
     # Record Python and library versions on every run.
     import importlib.metadata
     versions = {}
-    for p in ['numpy', 'pandas', 'scipy', 'scikit-learn', 'alphagenome', 'torch', 'joblib']:
+    for p in ['numpy', 'pandas', 'scipy', 'scikit-learn', 'torch', 'joblib']:
         try:
             versions[p] = importlib.metadata.version(p)
         except importlib.metadata.PackageNotFoundError:
@@ -71,9 +53,7 @@ def platform_metadata():
 
 def prepare_output(output, protected=(), preserve=()):
     # Clear the output directory while refusing to touch protected input paths.
-    # Entries whose basename is listed in ``preserve`` are kept across runs; this
-    # is how the long-lived caches (alphagenome_cache/, decima_cache/, prepared/)
-    # survive a re-run instead of being deleted and re-downloaded.
+    # Entries whose basename is listed in ``preserve`` are kept across runs.
     output = Path(output).resolve()
     protected = {Path(p).resolve() for p in protected if p is not None}
     for guard in protected:
@@ -91,6 +71,37 @@ def prepare_output(output, protected=(), preserve=()):
                 child.unlink()
     output.mkdir(parents=True, exist_ok=True)
     return output
+
+
+def summarize_feature_impact(feature_impact, top_k=10):
+    """Compact per-dataset summary of block LOO and coefficient attributions for evaluation.json."""
+    summary = {}
+    for dataset, record in feature_impact.items():
+        full_rmse = record['full_rmse']
+        loo_ranked = sorted(record['leave_one_block_out'],
+                            key=lambda entry: -entry['delta_rmse_vs_full'])
+        attributions = sorted(record['feature_attributions'],
+                              key=lambda entry: -entry['importance_fraction'])
+        block_rollup = {}
+        for entry in record['feature_attributions']:
+            block = entry['feature'].split(':', 1)[0]
+            block_rollup[block] = block_rollup.get(block, 0.0) + entry['importance_fraction']
+        summary[dataset] = {
+            'enabled_blocks': record['enabled_blocks'],
+            'full_rmse': full_rmse,
+            'block_leave_one_out': [
+                {'removed_block': row['removed_block'],
+                 'rmse': row['rmse'],
+                 'delta_rmse_vs_full': row['delta_rmse_vs_full']}
+                for row in loo_ranked
+            ],
+            'configured_ablations': record.get('configured_ablations', []),
+            'top_features': attributions[:int(top_k)],
+            'importance_fraction_by_block': dict(sorted(block_rollup.items(),
+                                                       key=lambda kv: -kv[1])),
+            'attribution_method': record['attribution_method'],
+        }
+    return summary
 
 
 def log_event(path, event, **details):

@@ -8,6 +8,7 @@ from pathlib import Path
 from dataclasses import dataclass
 import argparse
 import gzip
+import json
 import re
 import zipfile
 import numpy as np
@@ -282,12 +283,48 @@ def prepare_dataset(dataset, root, output, source_context='K562', target_context
     missing = [name for name in adapter.inputs if not (root / name).is_file()]
     if missing:
         raise FileNotFoundError('Missing source data: ' + ', '.join(missing))
-    options = dict(source_context=source_context, target_context=target_context, genome_build=genome_build)
-    frame = validate_frame(adapter.reader(root, **{name: options[name] for name in adapter.options}))
-    features = feature_columns(frame)
     inputs = Path(str(output) + '.inputs.csv.gz')
     targets = Path(str(output) + '.targets.csv.gz')
     report_path = Path(str(output) + '.json')
+    source_shas = {name: sha256(root / name) for name in adapter.inputs}
+    if all(p.is_file() for p in (output, inputs, targets, report_path)):
+        prior = json.loads(report_path.read_text())
+        prior_liftover_applied = bool(
+            isinstance(prior.get('liftover_to_grch38'), dict)
+            and prior['liftover_to_grch38'].get('applied'))
+        if prior.get('status') == 'validated' \
+                and prior.get('source_files_sha256') == source_shas \
+                and prior.get('context_pairs') and prior.get('rows') \
+                and prior_liftover_applied:
+            print(f'Reusing prepared and validated {prior["rows"]:,} examples at {output}', flush=True)
+            return PreparedData(output, inputs, targets, report_path, int(prior['rows']))
+    options = dict(source_context=source_context, target_context=target_context, genome_build=genome_build)
+    raw = adapter.reader(root, **{name: options[name] for name in adapter.options})
+    # Normalize every variant to GRCh38 and verify against the hg38 FASTA Decima reads.
+    # Without this step 73-77% of ref alleles disagree with the FASTA (see
+    # regulatory_model/liftover.py docstring for the empirical mismatch counts), which
+    # silently drives Decima to score the wrong reference base. Rows that cannot be
+    # reconciled are dropped and recorded in the dataset report rather than skewing
+    # downstream features.
+    from .liftover import normalize_to_grch38, default_chain_path, default_hg38_fasta
+    hg38_fasta = default_hg38_fasta(PROJECT_ROOT)
+    chain = default_chain_path(PROJECT_ROOT)
+    liftover_provenance = {'applied': False, 'reason': 'hg38_fasta_absent'}
+    if hg38_fasta.is_file():
+        raw, liftover_provenance = normalize_to_grch38(raw, hg38_fasta, chain)
+        liftover_provenance['applied'] = True
+        print(f'  liftover[{dataset}]: '
+              f'{liftover_provenance["normalized_rows"]}/'
+              f'{liftover_provenance["input_rows"]} variants verified against hg38 '
+              f'({liftover_provenance["dropped_rows"]} dropped as unresolvable); '
+              f'mapping_methods={liftover_provenance["mapping_method_counts"]}',
+              flush=True)
+    else:
+        print(f'  liftover[{dataset}]: SKIPPED (no hg38 FASTA at '
+              f'{hg38_fasta}); variants will be scored on their declared coordinates.',
+              flush=True)
+    frame = validate_frame(raw)
+    features = feature_columns(frame)
     output.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(output, index=False)
     frame[['example_id'] + features].to_csv(inputs, index=False)
@@ -295,8 +332,9 @@ def prepare_dataset(dataset, root, output, source_context='K562', target_context
     write_json(report_path, {
         'status': 'validated', 'dataset': dataset, 'rows': len(frame), 'unique_variants': frame.variant_id.nunique(),
         'features': features, 'target_fields': OUTCOMES,
+        'liftover_to_grch38': liftover_provenance,
         'feature_missing_fraction': frame[features].isna().mean().to_dict(),
-        'source_files_sha256': {name: sha256(root / name) for name in adapter.inputs},
+        'source_files_sha256': source_shas,
         'prepared_files_sha256': {path.name: sha256(path) for path in [output, inputs, targets]},
         'genome_build': frame.genome_build.unique().tolist(),
         'context_pairs': frame[['source_context', 'target_context']].drop_duplicates().to_dict('records'),
