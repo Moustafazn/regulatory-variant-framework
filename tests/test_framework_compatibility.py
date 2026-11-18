@@ -43,8 +43,9 @@ def test_legacy_config_and_api_preserve_predictions(tmp_path, training):
     pd.testing.assert_frame_equal(current, old, check_exact=True)
     assert np.isfinite(current.predicted_context_transfer_delta).all()
     np.testing.assert_allclose(current.filter(regex='^support_').sum(axis=1), 1)
-    np.testing.assert_allclose(current.predicted_target_effect,
-                               candidates.source_effect.to_numpy() + current.predicted_context_transfer_delta)
+    assert np.isfinite(current.predicted_target_effect).all()
+    assert not np.allclose(current.predicted_target_effect,
+                           candidates.source_effect.to_numpy() + current.predicted_context_transfer_delta)
 
 
 def test_existing_public_imports_still_work():

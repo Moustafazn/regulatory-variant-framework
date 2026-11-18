@@ -285,7 +285,7 @@ def build_coordinates(dataset: str, args, reference) -> tuple[pd.DataFrame, Path
                 ), prepared_path, coordinates_path
 
     results = []
-    if dataset == 'bourges':
+    if dataset == 'bourges' and not prepared.genome_build.eq('GRCh38').all():
         if not args.bourges_oligos.is_file():
             raise FileNotFoundError(f'Missing Bourges source oligos: {args.bourges_oligos}')
         from Bio import Align
@@ -439,10 +439,54 @@ def request_signature(dataset, prepared_path, coordinates_path, package_version,
     return signature, settings
 
 
+def restrict_to_plan(frame, dataset, plan_path):
+    """Keep only the example IDs a verified run plan lists for this dataset."""
+    if plan_path is None:
+        return frame
+    plan = json.loads(Path(plan_path).read_text())['datasets']
+    wanted = set(plan.get(dataset, ()))
+    absent = wanted - set(frame.example_id)
+    if absent:
+        raise ValueError(f'{dataset}: {len(absent):,} planned example IDs are not in the prepared table; '
+                         'rerun scripts/verify_run_inputs.py.')
+    return frame[frame.example_id.isin(wanted)].reset_index(drop=True)
+
+
+def retire_mislocated_files(frame, dataset, output_dir):
+    """Move track files scored at another coordinate into _stale_mislocated/ so they are re-fetched."""
+    stale_dir = output_dir / '_stale_mislocated'
+    moved = 0
+    for row in frame.itertuples(index=False):
+        stem = npz_stem(dataset, row.example_id)
+        npz, provenance = output_dir / f'{stem}.npz', output_dir / f'{stem}.provenance.json'
+        if not npz.is_file():
+            continue
+        correct = False
+        if provenance.is_file():
+            record = json.loads(provenance.read_text())
+            scored = (record.get('grch38_variant') or record.get('variant')
+                      or record.get('bourges_coordinate_correction') or {})
+            correct = (str(scored.get('chrom', '')).removeprefix('chr') == str(row.hg38_chrom).removeprefix('chr')
+                       and int(scored.get('position', -1)) == int(row.hg38_position)
+                       and scored.get('ref') == str(row.hg38_ref) and scored.get('alt') == str(row.hg38_alt))
+        if not correct:
+            stale_dir.mkdir(exist_ok=True)
+            for path in (npz, provenance):
+                if path.is_file():
+                    path.replace(stale_dir / path.name)
+            moved += 1
+    return moved
+
+
 def download_dataset(dataset, client, args, package_version, variant_scorers):
     from alphagenome.data import genome
     from alphagenome.models import dna_client
     frame, prepared_path, coordinates_path = build_coordinates(dataset, args, args.reference_records)
+    frame = restrict_to_plan(frame, dataset, args.example_ids_file)
+    retired = retire_mislocated_files(frame, dataset, args.output_dir)
+    if retired:
+        print(f'{dataset}: moved {retired:,} mislocated track files to _stale_mislocated/ for re-fetching.',
+              flush=True)
     signature, settings = request_signature(
         dataset, prepared_path, coordinates_path, package_version,
         str(getattr(client, '_model_version', 'server_default')),
@@ -567,6 +611,8 @@ def build_parser():
     parser.add_argument('--chain', type=Path, default=DEFAULT_CHAIN,
                         help='hg19-to-hg38 chain; downloaded into the track folder if absent.')
     parser.add_argument('--bourges-oligos', type=Path, default=DEFAULT_BOURGES_OLIGOS)
+    parser.add_argument('--example-ids-file', type=Path, default=None,
+                        help='Run plan written by scripts/verify_run_inputs.py; downloads only its example IDs.')
     return parser
 
 

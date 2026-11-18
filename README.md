@@ -1,274 +1,340 @@
 # Regulatory Variant Interpretation Framework
 
-**Context-dependent prediction, integrated molecular evidence, uncertainty, and expert review.**
+### Context-dependent prediction, integrated molecular evidence, uncertainty, and expert review
 
-This research framework studies how a non-coding variant's regulatory effect changes between cellular contexts. It brings together MPRA data preparation, genome-build harmonization, foundation-model and mechanistic evidence, effect prediction, uncertainty analysis, expert-review workflows, and locus-grouped evaluation.
+A Python framework for predicting how a non-coding regulatory variant's allelic effect changes
+between cellular contexts, with an explicit uncertainty layer that separates *confident*
+predictions from those that require human review.
 
-**NeuroJICO is the framework's human–AI collaboration component.** It uses rough-soft boundary cases to select variants for expert review and is evaluated alongside AI alone, rough-soft AI, and an alternative expert-review selection strategy. NeuroJICO is one method within the study; the framework also includes the data, predictors, uncertainty controls, feature-impact analysis, and reproducibility infrastructure shared by these methods.
+---
 
-The [research proposal](docs/regulatory_variant_proposal.md) describes the study and planned expert protocol.
+## Scientific scope and motivation
 
-## Scientific scope
+Most variants associated with human disease fall outside protein-coding regions. Their effect is
+regulatory: they change how much a nearby gene is transcribed, and that change is often
+**context-dependent** — a variant may alter expression in one cell type and do nothing in another.
 
-The primary endpoint is the **context-transfer delta**, `target_effect - source_effect`, measured on paired MPRA allele effects. Target-context effects are a secondary endpoint. The current study uses Siraj for development and rough-soft precision tuning, and evaluates Ho (Jurkat → primary T cells) and Bourges (resting → stimulated primary T cells) as separate tasks. Supporting another context requires suitable paired measurements and explicit model-context configuration.
+Massively parallel reporter assays (MPRAs) measure these allelic effects directly by testing both
+alleles of thousands of variants inside living cells. But an MPRA measures one context at a time,
+and the measurement error on a single variant is frequently as large as the effect itself. This
+creates a practical problem for interpretation:
 
-The framework combines five evidence blocks:
+> When a variant's measured effect differs between two contexts, is that a **true biological
+> context difference**, or simply **insufficient evidence** in one of the measurements?
 
-| Block | Evidence | Interpretation |
-|---|---|---|
-| `avi` | Local AlphaGenome AVI raw and PHRED scores | Global SNV impact; not a directional, cell-specific expression measurement |
-| `tracks` | Cached AlphaGenome RNA-seq, CAGE, DNase, ATAC, and CHIP_TF scores | Per-state score averages; enabled for a dataset when coverage is complete |
-| `decima` | Frozen Decima gene-expression deltas | Model-defined cell states, with missing-task proxies declared explicitly |
-| `mechanistic` | δSVM and motifbreakR annotations | Available sequence and transcription-factor evidence |
-| `dhs` | DNase accessibility annotations | Available chromatin-context evidence |
+This framework addresses that question directly. It does three things:
 
-MPRA effects and their standard errors provide fitting labels and rough-soft class support. Measured target outcomes are excluded from the fused predictor inputs and review cards. A Ridge head predicts the context-transfer delta; the variable-precision rough-soft layer estimates support for maintained, weakened, strengthened, and reversed effects.
+1. **Predicts** the context-transfer effect (target effect minus source effect) for a variant,
+   fusing genome foundation-model annotations with mechanistic sequence evidence.
+2. **Quantifies uncertainty** using a variable-precision rough-soft set (Ziarko 1993), which
+   partitions variants into a confidently classified region and a *boundary region* where the
+   evidence cannot separate the classes.
+3. **Routes the boundary region to expert review**, producing structured review cards and
+   accepting corrections that must be declared independent of the measured outcome labels.
 
-```mermaid
-flowchart TD
-    A[MPRA data and genome-build harmonization] --> B[Paired effects and uncertainty]
-    C[AlphaGenome, Decima, mechanistic and DHS evidence] --> D[Feature fusion and Ridge prediction]
-    B -->|Fitting labels| D
-    B -->|Fitting-fold class support| E[Rough-soft uncertainty]
-    D --> E
-    E --> F[NeuroJICO: boundary-case expert review]
-    D --> G[Locus-grouped evaluation and feature impact]
-    E --> G
-    F --> G
-    G --> H[Evaluation, provenance and review artifacts]
+The design goal is honesty about uncertainty rather than maximal apparent accuracy. Measurement
+error is propagated into the class labels, predictors are strictly separated from outcomes, and
+evaluation is grouped by genomic locus so that linkage disequilibrium cannot leak between folds.
+
+---
+
+## Architecture
+
+![Framework architecture](docs/images/neurojico_model.png)
+
+### Pipeline stages
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│  INPUT                                                                           │
+│  Regulatory DNA segment ── REF allele ──┐                                        │
+│                          └─ ALT allele ──┴─► both alleles tested in each context  │
+│                                             (source context ─► target context)   │
+└──────────────────────────────────────────────────────────────────────────────────┘
+                                        │
+                                        ▼
+┌───────────────┐   ┌───────────────┐   ┌────────────────┐   ┌──────────────┐   ┌──────────────┐
+│ 1 EVIDENCE    │──►│ 2 PREDICTOR   │──►│ 3 ROUGH-SOFT   │──►│ 4 EXPERT     │──►│ 5 OUTPUT     │
+│               │   │               │   │   UNCERTAINTY  │   │   REVIEW     │   │              │
+│ AlphaGenome   │   │ Ridge heads:  │   │ VPRS over kNN  │   │ review cards │   │ maintained   │
+│   AVI         │   │  • source     │   │ neighbourhoods │   │ for boundary │   │ weakened     │
+│ AlphaGenome   │   │  • target     │   │                │   │ variants     │   │ strengthened │
+│   tracks      │   │  • context    │   │ lower / upper  │   │              │   │ reversed     │
+│ Decima        │   │    transfer   │   │ class support  │   │ accept /     │   │ ───────────  │
+│ Mechanistic   │   │               │   │                │   │ challenge /  │   │ boundary ►   │
+│   (δSVM,      │   │ precision-    │   │ β threshold    │   │ defer        │   │ unresolved   │
+│   motifbreakR)│   │ weighted fit  │   │                │   │              │   │              │
+│ DHS chromatin │   │               │   │                │   │ independence │   │ + per-class  │
+│               │   │               │   │                │   │ enforced     │   │   support    │
+└───────────────┘   └───────────────┘   └────────────────┘   └──────────────┘   └──────────────┘
+        ▲                                                                              │
+        └──────────── development feedback only; held-out labels never seen ───────────┘
 ```
 
-## NeuroJICO and the comparison methods
+### Module map
 
-| Method key | Role |
-|---|---|
-| `ai_alone` | Ridge prediction for every variant |
-| `rough_soft_ai` | Rough-soft gating; rejected cases use the source effect as the configured fallback |
-| `expert_alone` | Expert-action replacement on a matched budget of variants chosen by a non-VPRS selector; AI elsewhere |
-| `neurojico` | Expert-action replacement on rough-soft boundary variants; AI elsewhere |
+| Module | Responsibility |
+| --- | --- |
+| `regulatory_model/data_prep.py` | Dataset adapters, schema validation, feature whitelist |
+| `regulatory_model/liftover.py` | GRCh37 → GRCh38 lift-over with per-base FASTA verification |
+| `regulatory_model/dataset_cohorts.py` | Cohort assembly, AVI/track joins, leakage removal, sampling |
+| `regulatory_model/model.py` | `MechanisticFusion`, `RidgeHead`, `VariablePrecisionRoughSoft` |
+| `regulatory_model/evaluation.py` | Locus grouping, class labels, grouped CV, bootstrap metrics |
+| `regulatory_model/replicates.py` | Replicate-level measurement quality (report-only) |
+| `regulatory_model/decima_scorer.py` | Decima inference wrapper with per-state caching |
+| `regulatory_model/pipeline.py` | End-to-end orchestration and audit writing |
+| `regulatory_model/api.py` | In-memory `fit` / `predict` interface |
 
-The `expert_alone` name is retained in result files, but this arm is a budgeted review baseline, not a human prediction for every variant. The comparison tests the selection strategy as well as the prediction workflow.
+---
 
-**Research status:** development evaluation files have been produced locally, but datasets and run outputs are not included in Git. Their presence does not establish improved predictive performance or a completed expert study. The current implementation accepts categorical `accept`, `challenge`, and `defer` actions, with review time specified in configuration. The proposal's blinded study with numeric expert estimates and measured review time remains separate work. Without expert actions, the configured acceptance behavior keeps the AI prediction.
+## Repository structure
 
-## Repository layout
-
-```text
+```
 regulatory-variant-framework/
-├── main.py                         # Framework CLI
-├── pyproject.toml                  # Package metadata, commands and dependencies
-├── requirements-lock.txt           # Version-range constraints, not exact pins
-├── regulatory_model/
-│   ├── api.py                      # DataFrame fit/predict interface
-│   ├── config.json                 # Evidence, context and evaluation settings
-│   ├── data_prep.py                # Dataset adapters and validation
-│   ├── liftover.py                 # Genome-build normalization
-│   ├── dataset_cohorts.py          # Cohort, AVI and track loading
-│   ├── decima_scorer.py            # Frozen Decima scoring and provenance
-│   ├── model.py                    # Feature blocks, Ridge and rough-soft support
-│   ├── pipeline.py                 # Full workflow and comparison methods
-│   ├── evaluation.py               # Locus grouping, metrics and selective curves
-│   └── reporting.py                # JSON outputs and audit utilities
-├── scripts/                        # AVI and cell-state track acquisition
-├── tests/                          # Offline compatibility and smoke tests
+├── main.py                      # CLI entry point for the full pipeline
+├── regulatory_model/            # Library package
+│   ├── api.py                   # RegulatoryVariantModel (fit / predict)
+│   ├── config.json              # All settings: seeds, margins, cell states, blocks
+│   ├── data_prep.py             # Dataset adapters and schema validation
+│   ├── dataset_cohorts.py       # Cohort assembly and leakage control
+│   ├── decima_scorer.py         # Decima inference and caching
+│   ├── evaluation.py            # Splits, labels, grouped metrics
+│   ├── liftover.py              # Genome-build normalisation
+│   ├── model.py                 # Fusion, Ridge heads, rough-soft set
+│   ├── pipeline.py              # Orchestration, audit, evaluation outputs
+│   ├── replicates.py            # Replicate quality (never a model input)
+│   └── reporting.py             # JSON writing, hashing, provenance
+├── scripts/                     # Standalone utilities (read-only unless noted)
+│   ├── verify_run_inputs.py     # Pre-run cohort verification; writes the run plan
+│   ├── download_alphagenome_avi.py
+│   ├── download_alphagenome_tracks.py
+│   ├── audit_replicates.py      # Replicate reliability report
+│   ├── audit_raw_features.py    # Candidate-feature audit
+│   ├── build_expert_evidence.py # Expert-review evidence generator
+│   └── diagnose_vprs*.py        # Uncertainty-layer diagnostics
 ├── docs/
+│   ├── METHODS.md               # Detailed methods reference
 │   ├── regulatory_variant_proposal.md
-│   └── templates/                  # Training and candidate CSV schemas
-├── data/                           # Local inputs and model resources; ignored
-└── output/experiments/
-    └── regulatory-variant-framework/ # Local prepared tables and run outputs; ignored
+│   ├── images/                  # Architecture diagram
+│   └── templates/               # Input CSV templates
+├── tests/                       # Offline test suite
+├── data/                        # Input data (not tracked)
+└── output/                      # Generated artefacts (not tracked)
 ```
 
-The existing Python package remains `regulatory_model`. Source data, large archives, model resources, virtual environments, credentials, and experiment outputs stay outside version control.
+---
 
 ## Installation
 
-Python 3.11 or newer is required. Clone the repository using an account with access, then install from its root:
+Requires **Python ≥ 3.11**.
 
 ```bash
 git clone https://github.com/Moustafazn/regulatory-variant-framework.git
 cd regulatory-variant-framework
-python -m venv venv
-source venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e '.[test]'
-regulatory-variants --help
+
+python3.11 -m venv venv
+source venv/bin/activate          # Windows: venv\Scripts\activate
+
+pip install -e .                  # core library
+pip install -e ".[test]"          # plus the test suite
+pip install -e ".[alphagenome]"   # plus the AlphaGenome API client
 ```
 
-The main pipeline reads local AlphaGenome annotations. Decima downloads model weights on first use. Install the optional AlphaGenome client for track acquisition:
+Verify the install:
 
 ```bash
-python -m pip install -e '.[alphagenome]' biopython
+venv/bin/python -m pytest -q
 ```
 
-The AVI utility uses Biopython for reference/mapping operations and `truststore` for OS-trusted HTTPS certificates. `pysam` is needed only for an already unpacked AVI `.tsv.gz`, not the ZIP-reader path.
+### Optional external resources
 
-## Data preparation
+| Resource | Needed for | How to obtain |
+| --- | --- | --- |
+| AlphaGenome AVI archive | `avi` feature block | `scripts/download_alphagenome_avi.py` |
+| AlphaGenome track NPZs | `tracks` feature block | `scripts/download_alphagenome_tracks.py` (needs `ALPHAGENOME_API_KEY`) |
+| Decima weights | `decima` feature block | Downloaded automatically from Hugging Face on first use |
+| hg38 FASTA / chain file | Lift-over verification | Fetched by the download scripts |
 
-Place the source files in `data/regulatory_audit/` using these filenames:
+Every block is optional. Blocks without data are reported as disabled in `audit.json` rather than
+silently filled with zeros.
 
-| File | Source and role |
-|---|---|
-| `ho_supp.xlsx` | Ho supplementary workbook; [article](https://doi.org/10.1038/s41588-025-02301-3), [GSE297471](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE297471); held-out context task |
-| `bourges_barcode_counts.txt.gz` | Bourges barcode counts; [article](https://doi.org/10.15252/emmm.202012112), [GSE135925](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE135925); held-out context task |
-| `siraj_MPRA.zip`, `siraj_tables.zip` | Siraj development data; [article](https://doi.org/10.1038/s41586-026-10121-6), [Zenodo archive](https://zenodo.org/records/15297965) |
-| `ho_bourges_shared_rsids.txt` | Audited shared-variant exclusion list, required before evaluation |
+---
 
-Save the Ho supplementary workbook as `ho_supp.xlsx`. The quantitative loader reads this workbook; `ho_normalized_counts.txt.gz` is supporting data, not a required model input. Save the Siraj archive's `data_MPRA.zip` and `tables.zip` using the local filenames above. The overlap list must come from the audited data preparation; an empty placeholder does not provide leakage control.
+## How to run
 
-Download the Bourges counts with:
+### 1. Verify inputs (recommended first step)
+
+Builds the exact cohort the pipeline will evaluate, checks coordinates, alleles, leakage and fold
+feasibility, then writes `output/run_plan.json`. Read-only; makes no API calls.
 
 ```bash
-mkdir -p data/regulatory_audit
-curl -L 'https://ftp.ncbi.nlm.nih.gov/geo/series/GSE135nnn/GSE135925/suppl/GSE135925_barcode_counts.txt.gz' \
-  -o data/regulatory_audit/bourges_barcode_counts.txt.gz
+venv/bin/python scripts/verify_run_inputs.py --run siraj=400,ho=600
 ```
 
-Prepare each dataset before extracting AVI annotations or requesting tracks:
+### 2. Run the pipeline
 
 ```bash
-python -m regulatory_model.data_prep --dataset ho \
-  --root data/regulatory_audit \
-  --output output/experiments/regulatory-variant-framework/prepared/ho.csv.gz
-python -m regulatory_model.data_prep --dataset bourges \
-  --root data/regulatory_audit \
-  --output output/experiments/regulatory-variant-framework/prepared/bourges.csv.gz
-python -m regulatory_model.data_prep --dataset siraj \
-  --root data/regulatory_audit \
-  --output output/experiments/regulatory-variant-framework/prepared/siraj.csv.gz
+venv/bin/python main.py --sample-per-dataset siraj=400 --sample-per-dataset ho=600
 ```
 
-The main workflow also prepares these datasets. Genome normalization uses the configured local hg38 FASTA and chain resources when available; inspect the preparation reports' `liftover_to_grch38` field. Prepared tables without a verified GRCh38 normalization must not be treated as validated Decima inputs. Resolve source builds and allele orientation before interpreting scores.
+Useful options:
 
-## AlphaGenome AVI annotations
+| Option | Effect |
+| --- | --- |
+| `--sample-per-dataset NAME=N` | Cap variants per dataset (deterministic, nested across caps) |
+| `--sample-chrom chr1` | Restrict every dataset to one chromosome |
+| `--skip-decima` | Skip Decima scoring; declared in `audit.json` |
+| `--expert-corrections FILE` | Apply reviewer corrections |
+| `--output DIR` | Experiment directory |
+| `--config FILE` | Alternative configuration |
 
-The AVI utility downloads/resumes the approximately 88 GB precomputed archive at `data/alphagenome_avi/avi_scores_snvs_tabix.zip`:
+### 3. Outputs
 
-```bash
-python scripts/download_alphagenome_avi.py --download-archive
-python scripts/download_alphagenome_avi.py --datasets ho bourges siraj
-```
+| File | Contents |
+| --- | --- |
+| `evaluation.json` | Metrics for every method and baseline, both endpoints, with CIs |
+| `audit.json` | Config hash, input hashes, provenance, timings, declared limitations |
+| `review_cards.json` | One card per boundary variant for expert review |
+| `feature_impact.json` | Per-block leave-one-out and coefficient attribution |
 
-It reads the ZIP's stored score member in place and extracts only the small index. It uses `hg38.2bit` and, for Bourges, an hg19-to-hg38 chain and source oligos to resolve coordinates. Archive, reference, mapping resources, and extracted `*.avi.csv.gz` tables remain in `data/alphagenome_avi/`.
+Runs are reproducible from `config.json`'s seed: sampling uses a SHA-256 rank of
+`seed:dataset:example_id`, so a smaller cap is always a subset of a larger one.
 
-Only matched single-nucleotide substitutions enter the AVI cohort; indels and unmatched records are unsupported. The pipeline checks prepared-input hashes before joining the extracted annotations. Both acquisition utilities accept `--prepared-dir` for a custom experiment location.
+---
 
-## AlphaGenome cell-state scores
+## How to use it as a package
 
-The track utility requests the configured scorers, averages raw scores by cell-state ontology groups, and writes one NPZ per variant to `data/alphagenome_tracks/`. The current default groups are `primary_T` and `jurkat`, with five modalities per group. A dataset's track block requires complete coverage; use `--require-tracks` in the framework CLI to make incomplete coverage an error.
+### Input
 
-```bash
-export ALPHAGENOME_API_KEY='your-key'
-python scripts/download_alphagenome_tracks.py --datasets bourges
-python scripts/download_alphagenome_tracks.py
-```
+`fit()` takes measured variant pairs — the same variant assayed in a source and a target context.
+All coordinates must be GRCh38.
 
-The utility defaults to Bourges, Ho, then Siraj and skips existing variant NPZs. Interrupt and rerun to resume. It resolves coordinates before API requests and stores manifests alongside the files. Check the provider's applicable terms before using API-derived outputs in fitted models.
+| Column | Meaning |
+| --- | --- |
+| `example_id`, `variant_id` | Identifiers |
+| `chrom`, `position`, `ref`, `alt`, `genome_build` | GRCh38 coordinates and alleles |
+| `source_context`, `target_context` | Context labels (one pair per model) |
+| `source_effect`, `source_se` | Measured effect and standard error in the source context |
+| `target_effect`, `target_se` | Measured effect and standard error in the target context |
+| `effect_covariance` | Covariance of the two errors; `0` only if genuinely independent |
+| `avi_raw_score`, `avi_phred` | AlphaGenome AVI annotations |
 
-## Run the full framework
+`predict()` takes **unlabeled** candidates — `chrom`, `position`, `genome_build`, `ref`, `alt`,
+plus AVI columns. Supplying `target_effect` or `target_se` raises an error, which prevents
+accidental label leakage. Adding `source_effect` additionally returns a target-effect estimate.
 
-Once prepared tables, matched AVI annotations, and the chosen model resources are available:
+Templates: `docs/templates/training_variants.csv`, `docs/templates/candidate_variants.csv`.
 
-```bash
-regulatory-variants --output output/experiments/regulatory-variant-framework
-# Equivalent source-checkout entry point:
-python main.py --output output/experiments/regulatory-variant-framework
-```
-
-Useful options include:
-
-```bash
-# Require complete cached AlphaGenome track coverage.
-regulatory-variants --require-tracks
-
-# Declare a reduced-evidence run without Decima inference.
-regulatory-variants --skip-decima
-
-# Apply supported, evidence-linked fitting-fold corrections.
-regulatory-variants --expert-corrections path/to/expert_corrections.json
-
-# Use an isolated directory for a limited development run.
-regulatory-variants --output output/experiments/development \
-  --sample-chrom chr1 --sample-per-dataset siraj=200 --sample-per-dataset ho=300
-```
-
-`--data-root`, `--avi-dir`, `--tracks-dir`, and `--config` override the resource paths. The default configuration is `regulatory_model/config.json`, under the top-level `framework` key. Context aliases and model-task mappings must be explicit; missing Decima tasks may use configured proxies whose provenance should be inspected.
-
-**An existing output directory is reused:** the runner preserves `prepared/` and `decima_scores/` but replaces other run outputs. Choose a new `--output` directory to keep a prior run intact. Review corrections require an example ID, supported field/value, reason, and HTTPS evidence URL; corrections outside the fitting fold are rejected.
-
-## Python interface
-
-`RegulatoryVariantModel` fits a predictor and rough-soft support model for one source/target context pair. It returns predictions and uncertainty fields for unlabeled candidate variants; it does not conduct an expert study. The DataFrame API uses local AVI columns, optional mechanistic/DHS columns, and Decima. Cached AlphaGenome track NPZs are consumed by the full CLI pipeline, not this in-memory interface.
+### Process
 
 ```python
 import pandas as pd
 from regulatory_model import RegulatoryVariantModel
 
-training = pd.read_csv('training_variants.csv')
-candidates = pd.read_csv('candidate_variants.csv')
+training = pd.read_csv("docs/templates/training_variants.csv")
+candidates = pd.read_csv("docs/templates/candidate_variants.csv")
 
-model = RegulatoryVariantModel()
-model.fit(training)
+model = RegulatoryVariantModel(use_decima=False).fit(training)
 predictions = model.predict(candidates)
-predictions.to_csv('candidate_predictions.csv', index=False)
 ```
 
-Start from the header-only [training schema](docs/templates/training_variants.csv) and [candidate schema](docs/templates/candidate_variants.csv); populate them with actual data before use.
+`fit()` validates the schema, fuses the enabled evidence blocks, fits the Ridge heads, and
+estimates class support by propagating the reported measurement errors through Monte-Carlo
+sampling. `predict()` fuses the same blocks for the candidates and returns both the point
+prediction and its rough-soft support.
 
-| Training columns | Requirements |
-|---|---|
-| `example_id`, `variant_id` | Unique paired-example ID and stable variant ID |
-| `chrom`, `position`, `genome_build` | Valid chromosome, 1-based position, and `GRCh38` |
-| `ref`, `alt` | Reference/alternate DNA alleles; AVI annotations must match the SNV |
-| `source_context`, `target_context` | One context pair matching configured state names, labels, or aliases |
-| `source_effect`, `target_effect` | Paired effects on the same scale and orientation |
-| `source_se`, `target_se` | Positive standard errors |
-| `effect_covariance` | Explicit measurement-error covariance; use zero only when independence is justified; magnitude ≤ `source_se * target_se` |
-| `avi_raw_score`, `avi_phred` | Required matched local AVI annotations |
+Constructor options:
 
-Candidates require `chrom`, `position`, `genome_build`, `ref`, `alt`, `avi_raw_score`, and `avi_phred`. IDs may be supplied or generated. Optional `source_effect` produces `predicted_target_effect` in addition to `predicted_context_transfer_delta`. Keep measured `target_effect` and `target_se` out of candidate inputs.
+```python
+RegulatoryVariantModel(
+    use_decima=True,     # set False to skip Decima inference
+    beta=None,           # override the rough-soft precision threshold (0 < beta < 1)
+    config_path=None,    # alternative config.json
+)
+```
 
-Optional mechanistic predictors are `delta_svm_nCD4`, the four `motifbreakr_{tcell,jurkat}_alleleDiff_{max,min}` fields, and the two `motifbreakr_{tcell,jurkat}_tf_count` fields. Optional DHS predictors are `dhs_hTH1`, `dhs_hTH17`, `dhs_hTH2`, `dhs_CD4`, `dhs_CD4pos_N`, `dhs_hTR`, `dhs_Jurkat`, and `dhs_CD8`.
+### Output
 
-Use `RegulatoryVariantModel(use_decima=False)` for a reduced-evidence model, or `beta=0.6` to override rough-soft precision. Prediction requires no AlphaGenome API calls.
+`predict()` returns one row per candidate:
 
-## Outputs and interpretation
+| Column | Meaning |
+| --- | --- |
+| `example_id`, `variant_id` | Identifiers carried through |
+| `source_context`, `target_context` | The fitted context pair |
+| `predicted_context_transfer_delta` | Predicted target effect minus source effect |
+| `predicted_target_effect` | Only when `source_effect` was supplied |
+| `in_rough_soft_boundary` | `True` when evidence cannot confidently classify the variant |
+| `mean_neighbor_distance` | Distance to the k nearest training variants |
+| `support_*`, `lower_*`, `upper_*` | Per-class support and rough-set bounds |
 
-| Artifact | Contents |
-|---|---|
-| `evaluation.json` | Four-method metrics, locus-grouped summaries, selective-risk curves, feature-impact summary |
-| `feature_impact.json` | Block leave-one-out ΔRMSE, configured ablations, coefficient × feature-standard-deviation attributions |
-| `review_cards.json` | Boundary cases with evidence and uncertainty; measured target effects omitted |
-| `expert_corrections.template.json` | Categorical correction template when no corrections were supplied |
-| `audit.json` | Framework identity, config/data hashes, resource provenance, runtime information and limitations |
-| `tuning.json` | Development-set β selection |
-| `cross_dataset_overlap_audit.json` | Coordinate and locus-overlap checks |
-| `run_log.jsonl`, `folds/`, `prepared/` | Progress events, fitted fold artifacts and prepared datasets |
+Classes are `maintained`, `weakened`, `strengthened` and `reversed`, assigned relative to a
+configurable effect margin.
 
-Run outputs are local, not bundled results. Foundation models remain frozen; only the Ridge and rough-soft components are fitted. Current Decima configuration declares a zero proxy for Jurkat when no atlas task exists. Model-task contexts are not donor-matched measurements. A completed expert panel and measured review times are needed for claims about human–AI benefit.
+**Interpreting the boundary flag.** `in_rough_soft_boundary=True` does not mean the prediction is
+wrong. It means the available evidence does not separate the classes at the configured precision
+threshold β, and the variant is a candidate for expert review rather than automated interpretation.
 
-## Compatibility and verification
+---
 
-The project was previously named `neurojico-rough-set`. The repository and distribution are now `regulatory-variant-framework`; the import package remains `regulatory_model`.
+## Configuration
 
-- `NeurojicoModel` remains an alias for `RegulatoryVariantModel`.
-- `neurojico` remains a CLI alias for `regulatory-variants`.
-- `NeurojicoOptions` and `run_neurojico` remain aliases for `FrameworkOptions` and `run_framework`.
-- Legacy configurations with a top-level `neurojico` block still load. Use exactly one of `framework` and `neurojico`.
-- The evaluation key `neurojico` continues to identify the NeuroJICO comparison arm.
-- New defaults use `output/experiments/regulatory-variant-framework/`. For older runs, set `--output` and the downloaders' `--prepared-dir` explicitly; existing historical files are not rewritten automatically.
+All settings live in `regulatory_model/config.json`:
 
-Run the offline checks with:
+| Key | Purpose |
+| --- | --- |
+| `seed` | Global determinism |
+| `margin` | Effect difference defining a context change |
+| `folds`, `gap_bp` | Grouped cross-validation and locus-linkage distance |
+| `rough.beta`, `rough.neighbors` | Rough-soft precision threshold and neighbourhood size |
+| `head.*` | Ridge α grid, source shrinkage, precision weighting |
+| `cell_states` | Ontology terms and context aliases per cell state |
+| `fusion.feature_blocks` | Which evidence blocks are active |
+| `secondary.task_queries` | Decima task selection per cell state |
+
+---
+
+## Testing
 
 ```bash
-python -m pytest -q
-regulatory-variants --help
+venv/bin/python -m pytest -q          # full suite
+venv/bin/python -m pytest -q -k api   # a subset
 ```
 
-These checks exercise the Python interface, compatibility, configuration, CLI paths, and audit writing. They do not replace a full MPRA/model-resource evaluation or establish scientific performance. The historical [NeuroJICO illustration](docs/images/neurojico_model.png) is retained as an earlier design artifact; its umbrella branding predates this rename.
+Tests run entirely offline with synthetic fixtures — no API keys, no downloads, no network.
+
+---
 
 ## Citation
 
-> Zain, M., & Hassanien, A. E. *Regulatory Variant Interpretation Framework: context-dependent prediction, integrated molecular evidence, uncertainty, and expert review.* Manuscript in preparation.
+If you use this framework, please cite it:
 
-This is the working project citation, not a published bibliographic record. Update it when the manuscript title and publication details are finalized.
+```bibtex
+@software{regulatory_variant_framework,
+  title  = {Regulatory Variant Interpretation Framework: context-dependent
+            regulatory variant interpretation with integrated molecular
+            evidence, uncertainty, and expert review},
+  author = {Zein, Moustafa and Hassanien, Aboul Ella},
+  year   = {2026},
+  url    = {https://github.com/Moustafazn/regulatory-variant-framework},
+  version = {1.0.0}
+}
+```
+
+### Methods and data this framework builds on
+
+| Component | Reference | DOI |
+| --- | --- | --- |
+| Variable-precision rough sets | Ziarko, *J. Comput. Syst. Sci.* (1993) | 10.1016/0022-0000(93)90048-2 |
+| deltaSVM | Lee et al., *Nat Genet* (2015) | 10.1038/ng.3331 |
+| motifbreakR | Coetzee et al., *Bioinformatics* (2015) | 10.1093/bioinformatics/btv470 |
+| HOCOMOCO v11 | Kulakovskiy et al., *NAR* (2018) | 10.1093/nar/gkx1106 |
+| DHS index | Meuleman et al., *Nature* (2020) | 10.1038/s41586-020-2559-3 |
+| PICS fine-mapping | Farh et al., *Nature* (2015) | 10.1038/nature13835 |
+| UK Biobank fine-mapping | Kanai et al., *Nat Genet* (2021) | 10.1038/s41588-021-00870-7 |
+| DICE T cell eQTL | Schmiedel et al., *Cell* (2018) | 10.1016/j.cell.2018.10.022 |
+| Immune caQTL | Gate et al., *Nat Genet* (2018) | 10.1038/s41588-018-0156-2 |
+| Stimulation-responsive chromatin | Calderon et al., *Nat Genet* (2019) | 10.1038/s41588-019-0505-9 |
+| ANANASTRA | Abramov et al., *NAR* (2022) | 10.1093/nar/gkac262 |
+| T cell MPRA | Mouri et al., *Nat Genet* (2022) | 10.1038/s41588-022-01056-5 |
+
+Foundation models used inference-only: **AlphaGenome** (Google DeepMind) and **Decima**.

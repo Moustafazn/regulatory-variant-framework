@@ -1,1 +1,7 @@
-chrom,position,genome_build,ref,alt,avi_raw_score,avi_phred
+chrom,position,genome_build,ref,alt,avi_raw_score,avi_phred,source_effect,source_se
+1,2000000,GRCh38,C,T,-1.2,0.5,-0.4,0.09
+1,2005000,GRCh38,C,T,-0.72,1.4,-0.24,0.09
+1,2010000,GRCh38,C,T,-0.24,2.3,-0.08,0.09
+1,2015000,GRCh38,C,T,0.24,3.2,0.08,0.09
+1,2020000,GRCh38,C,T,0.72,4.1,0.24,0.09
+1,2025000,GRCh38,C,T,1.2,5.0,0.4,0.09

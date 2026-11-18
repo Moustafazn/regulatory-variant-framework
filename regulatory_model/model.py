@@ -8,6 +8,7 @@ which concatenates the per-variant representation used by both the head and the 
 """
 import numpy as np
 from sklearn.linear_model import Ridge
+from sklearn.model_selection import GroupKFold, KFold
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 
@@ -103,7 +104,9 @@ def _avi_block(settings):
 
 
 def _tracks_block(settings):
-    cell_states = tuple(settings['cell_states'].keys())
+    # Tracks may cover only a subset of cell_states, because cached NPZs are keyed by the states present when downloaded.
+    cell_states = tuple(settings['fusion'].get('track_cell_states')
+                        or settings['cell_states'].keys())
     modalities = tuple(settings['fusion'].get('alphagenome_track_modalities', ()))
     columns = [f'tracks:{state}:{modality}' for state in cell_states for modality in modalities]
 
@@ -185,24 +188,131 @@ class MechanisticFusion:
         return np.concatenate(parts, axis=1) if parts else np.zeros((len(frame), 0))
 
 
+def source_prior(source, source_se):
+    """Mean and variance of the true source effect, estimated from the rows given."""
+    source = np.asarray(source, dtype=float)
+    se = np.asarray(source_se, dtype=float)
+    return float(source.mean()), float(max(source.var() - np.mean(se ** 2), 1e-6))
+
+
+def shrink_source(source, source_se, prior_mean, prior_var):
+    """Empirical-Bayes posterior mean of the true source effect given its measurement error."""
+    se2 = np.clip(np.asarray(source_se, dtype=float), 1e-6, None) ** 2
+    weight = prior_var / (prior_var + se2)
+    return prior_mean + weight * (np.asarray(source, dtype=float) - prior_mean)
+
+
 class RidgeHead:
-    """Ridge heads on the fused representation. Primary endpoint is the context-transfer delta
-    (target_effect - source_effect); source and target heads are kept as diagnostics only."""
+    """Standardised Ridge heads; the 'target' head is the primary-T prediction and also takes the shrunk source effect."""
 
     HEADS = ('context_transfer', 'source', 'target')
+    SOURCE_FEATURE = 'source:shrunk'
 
     def __init__(self, settings):
-        self.alpha = float(settings['head']['ridge_alpha'])
+        head = settings['head']
+        self.alpha = float(head['ridge_alpha'])
+        self.alpha_grid = tuple(sorted(float(a) for a in head.get('ridge_alpha_grid', ())))
+        self.alpha_cv_folds = int(head.get('alpha_cv_folds', 3))
+        self.use_source_feature = bool(head.get('shrink_source_feature', True))
+        # Half the Ho rows carry 5.5% of target variance; weighting by 1/target_se^2 stops them dominating the fit.
+        self.precision_weight = bool(head.get('precision_weight_target', False))
+        self.seed = int(settings.get('seed', 42))
+
+    def _weights(self, frame):
+        """Fit-row weights: inverse target measurement variance, normalised to mean 1, or None when disabled."""
+        if not self.precision_weight or 'target_se' not in frame.columns:
+            return None
+        se = np.clip(frame.target_se.to_numpy(dtype=float), 1e-3, None)
+        weight = 1.0 / se ** 2
+        mean = float(weight.mean())
+        return weight / mean if mean > 0 else None
 
     def fit(self, representations, frame):
+        """Fit every head on the given rows; the prior and each alpha are chosen from these rows only."""
+        x = np.asarray(representations, dtype=float)
         source = frame.source_effect.to_numpy(dtype=float)
         target = frame.target_effect.to_numpy(dtype=float)
+        source_se = frame.source_se.to_numpy(dtype=float)
+        self.scaler = StandardScaler().fit(x)
+        self.prior_mean, self.prior_var = source_prior(source, source_se)
+        self.mean_source_se = float(np.sqrt(np.mean(source_se ** 2)))
+        shrunk = shrink_source(source, source_se, self.prior_mean, self.prior_var)
+        self.shrunk_mean = float(shrunk.mean())
+        self.shrunk_std = float(shrunk.std()) or 1.0
+        z = self.scaler.transform(x)
+        designs = {'context_transfer': z, 'source': z, 'target': self._design(z, shrunk)}
         y = {'context_transfer': target - source, 'source': source, 'target': target}
-        self.models = {h: Ridge(alpha=self.alpha, random_state=0).fit(representations, y[h])
-                       for h in self.HEADS}
+        groups = frame['split_group'].to_numpy() if 'split_group' in frame.columns else None
+        weights = self._weights(frame)
+        self.alphas = {h: self._select_alpha(designs[h], y[h], groups, weights) for h in self.HEADS}
+        # Only the target head is weighted; the source and delta heads keep their own error structure.
+        self.models = {h: Ridge(alpha=self.alphas[h], random_state=0).fit(
+            designs[h], y[h], sample_weight=weights if h == 'target' else None) for h in self.HEADS}
         return self
 
-    def predict(self, representations, source_effect):
-        raw = {h: self.models[h].predict(representations) for h in self.HEADS}
-        raw['primary_T_reconstructed'] = np.asarray(source_effect, dtype=float) + raw['context_transfer']
+    def _design(self, z, shrunk):
+        """Append the standardised shrunk source effect to the standardised fused features."""
+        if not self.use_source_feature:
+            return z
+        return np.column_stack([z, (shrunk - self.shrunk_mean) / self.shrunk_std])
+
+    def _select_alpha(self, design, y, groups, weights=None):
+        """Pick alpha from the grid by inner grouped cross-validation on the fit rows, scoring on the same weights."""
+        if len(self.alpha_grid) < 2:
+            return self.alpha_grid[0] if self.alpha_grid else self.alpha
+        folds = min(self.alpha_cv_folds, len(np.unique(groups)) if groups is not None else len(y))
+        if folds < 2:
+            return self.alpha
+        splitter = (GroupKFold(n_splits=folds).split(design, y, groups) if groups is not None
+                    else KFold(folds, shuffle=True, random_state=self.seed).split(design))
+        splits = list(splitter)
+        errors = []
+        for alpha in self.alpha_grid:
+            sse = 0.0
+            for fit, valid in splits:
+                model = Ridge(alpha=alpha, random_state=0).fit(
+                    design[fit], y[fit], sample_weight=None if weights is None else weights[fit])
+                residual = (y[valid] - model.predict(design[valid])) ** 2
+                sse += float(residual.sum() if weights is None else (weights[valid] * residual).sum())
+            errors.append(sse)
+        return self.alpha_grid[int(np.argmin(errors))]
+
+    def predict(self, representations, source_effect, source_se=None):
+        """Predict all heads; a missing source_se falls back to the mean fit-row source error."""
+        z = self.scaler.transform(np.asarray(representations, dtype=float))
+        source = np.asarray(source_effect, dtype=float)
+        se = np.full(len(source), self.mean_source_se) if source_se is None else np.asarray(source_se, dtype=float)
+        shrunk = shrink_source(source, se, self.prior_mean, self.prior_var)
+        raw = {'context_transfer': self.models['context_transfer'].predict(z),
+               'source': self.models['source'].predict(z),
+               'target': self.models['target'].predict(self._design(z, shrunk))}
+        raw['primary_T_reconstructed'] = source + raw['context_transfer']
         return raw
+
+    def predict_context_transfer(self, representations):
+        """Delta prediction from the fused features alone, for candidates with no measured source."""
+        z = self.scaler.transform(np.asarray(representations, dtype=float))
+        return self.models['context_transfer'].predict(z)
+
+    def target_coefficients(self):
+        """Standardised coefficients of the target head: fused columns first, shrunk source last."""
+        return self.models['target'].coef_.copy()
+
+
+BASELINES = ('train_mean', 'source_copy', 'source_slope', 'source_shrunk')
+
+
+def fold_baselines(frame_fit, frame_held):
+    """No-feature target predictions for the held rows, fitted on the fit rows only."""
+    s_fit = frame_fit.source_effect.to_numpy(dtype=float)
+    t_fit = frame_fit.target_effect.to_numpy(dtype=float)
+    se_fit = frame_fit.source_se.to_numpy(dtype=float)
+    s_held = frame_held.source_effect.to_numpy(dtype=float)
+    se_held = frame_held.source_se.to_numpy(dtype=float)
+    mean, var = source_prior(s_fit, se_fit)
+    shrunk_fit = shrink_source(s_fit, se_fit, mean, var)
+    shrunk_held = shrink_source(s_held, se_held, mean, var)
+    return {'train_mean': np.full(len(s_held), t_fit.mean()),
+            'source_copy': s_held.copy(),
+            'source_slope': np.polyval(np.polyfit(s_fit, t_fit, 1), s_held),
+            'source_shrunk': np.polyval(np.polyfit(shrunk_fit, t_fit, 1), shrunk_held)}

@@ -26,14 +26,17 @@ from pydantic import BaseModel, ConfigDict, StringConstraints, TypeAdapter  # no
 from .dataset_cohorts import (  # noqa: E402
     _apply_dataset_sampling, _augment_with_mechanistic, _avi_features_from_frame,
     _cross_dataset_overlap_audit, _dataset_fold_feasibility, _load_avi_dataset,
-    _load_tracks_dataset, _prepare_development, _resolve_held_out,
+    _load_tracks_dataset, _prepare_development, _remove_dev_rows_near_held_out,
+    _resolve_held_out, _restrict_to_track_covered,
 )
 from .decima_scorer import DecimaGeneScorer  # noqa: E402
 from .evaluation import (  # noqa: E402
     CLASSES, grouped_folds, group_rmse, group_rmse_bootstrap,
-    inner_split, locus_groups, selective_curve,
+    inner_split, locus_groups, paired_locus_bootstrap, selective_curve,
 )
-from .model import MechanisticFusion, RidgeHead, VariablePrecisionRoughSoft  # noqa: E402
+from .model import (  # noqa: E402
+    BASELINES, MechanisticFusion, RidgeHead, VariablePrecisionRoughSoft, fold_baselines,
+)
 from .reporting import (  # noqa: E402
     log_event, platform_metadata, prepare_output, sha256,
     summarize_feature_impact, write_json,
@@ -60,10 +63,41 @@ class ExpertCorrection(BaseModel):
     value: Literal[0, 1, 'accept', 'challenge', 'defer'] | None
     reason: NonEmpty
     evidence_url: Https
+    independent_of_labels: bool
 
 
 # Type adapter used to parse a list of corrections from JSON.
 CORRECTIONS = TypeAdapter(list[ExpertCorrection])
+
+
+# A generated evidence record: the correction schema plus adjudication, with a null URL allowed only while pending a DOI.
+class ExpertEvidence(BaseModel):
+    model_config = ConfigDict(extra='forbid', frozen=True, allow_inf_nan=False)
+    example_id: NonEmpty
+    field: NonEmpty
+    value: Literal[0, 1, 'accept', 'challenge', 'defer'] | None
+    reason: NonEmpty
+    evidence_url: Https | None
+    independent_of_labels: bool
+    adjudicated_value: Literal[0, 1, 'accept', 'challenge', 'defer'] | None = None
+    call: Literal['supports', 'contradicts', 'insufficient'] = 'insufficient'
+
+
+# Type adapter used to parse a list of generated evidence records from JSON.
+EVIDENCE = TypeAdapter(list[ExpertEvidence])
+
+
+# Convert finalized evidence into strict corrections; records without a DOI are refused, not downgraded.
+def evidence_to_corrections(records):
+    missing = [r.example_id for r in records if r.evidence_url is None]
+    if missing:
+        raise ValueError(
+            f'{len(missing)} evidence records still have no DOI (first: {missing[0]!r}); '
+            'supply every DOI in data/regulatory_audit/evidence_sources.json before applying them.')
+    return [ExpertCorrection(example_id=r.example_id, field=r.field,
+                             value=r.adjudicated_value if r.adjudicated_value is not None else r.value,
+                             reason=r.reason, evidence_url=r.evidence_url,
+                             independent_of_labels=r.independent_of_labels) for r in records]
 
 
 # Load framework settings while accepting configurations from before the rename.
@@ -95,34 +129,36 @@ def default_output(name='regulatory-variant-framework'):
     return PROJECT_ROOT / 'output' / 'experiments' / name
 
 
-# Apply expert corrections restricted to the fitting fold; return (updated frame, applied records).
-def _apply_corrections(frame, corrections_path, fit_indices):
-    if not corrections_path:
-        return frame.copy(), []
-    corrections = CORRECTIONS.validate_json(Path(corrections_path).read_text())
-    allowed_dhs = set(DHS)
-    allowed_actions = {ExpertAction.accept, ExpertAction.challenge, ExpertAction.defer}
-    fit_ids = set(frame.iloc[fit_indices].example_id)
+# Apply independent expert records to a cohort: DHS corrections edit features before fusion, review actions are read at evaluation.
+def _apply_corrections(frame, corrections_path):
     updated = frame.copy()
-    if 'expert_action' not in updated.columns:
-        updated['expert_action'] = ''
-    applied = []
+    updated['expert_action'] = ''
+    if not corrections_path:
+        return updated, {'applied': [], 'skipped_not_in_cohort': [], 'rejected': []}
+    corrections = CORRECTIONS.validate_json(Path(corrections_path).read_text())
+    present = set(updated.example_id)
+    allowed_dhs, outcome = set(DHS), {'applied': [], 'skipped_not_in_cohort': [], 'rejected': []}
     for c in corrections:
-        if c.example_id not in fit_ids:
-            raise ValueError(f'Correction for {c.example_id} is outside the fitting fold')
+        record = c.model_dump(mode='json')
+        if c.example_id not in present:
+            outcome['skipped_not_in_cohort'].append(record)
+            continue
+        if not c.independent_of_labels:
+            outcome['rejected'].append({**record, 'rejected_because': 'evidence_not_independent_of_mpra_labels'})
+            continue
+        rows = updated.example_id == c.example_id
         if c.field in allowed_dhs:
             if c.value not in (0, 1, None):
                 raise ValueError(f'DHS correction value must be 0/1/None, got {c.value!r}')
-            updated.loc[updated.example_id == c.example_id, c.field] = (
-                np.nan if c.value is None else float(c.value))
+            updated.loc[rows, c.field] = np.nan if c.value is None else float(c.value)
         elif c.field == 'expert_action':
-            if c.value not in allowed_actions:
+            if c.value not in (ExpertAction.accept, ExpertAction.challenge, ExpertAction.defer):
                 raise ValueError(f'expert_action must be accept/challenge/defer, got {c.value!r}')
-            updated.loc[updated.example_id == c.example_id, 'expert_action'] = c.value
+            updated.loc[rows, 'expert_action'] = c.value
         else:
             raise ValueError(f'Correction field {c.field!r} is not DHS or expert_action')
-        applied.append(c.model_dump(mode='json'))
-    return updated, applied
+        outcome['applied'].append(record)
+    return updated, outcome
 
 
 # Coerce a scalar to float or None if non-finite / non-numeric.
@@ -171,7 +207,8 @@ def _collect_review_cards(frame, rough_result, scores, fused, settings, fold):
             },
             'editable_fields': list(DHS) + ['expert_action'],
             'allowed_actions': [ExpertAction.accept, ExpertAction.challenge, ExpertAction.defer],
-            'required_schema': ['example_id', 'field', 'value', 'reason', 'evidence_url'],
+            'required_schema': ['example_id', 'field', 'value', 'reason', 'evidence_url',
+                                'independent_of_labels'],
         }
         cards.append(card)
     return cards
@@ -191,6 +228,12 @@ def _save_fold(output, fold, head, rough):
 # Fit a Ridge head on one fold's fit side.
 def fit_fold_head(settings, fused_fit, frame_fit):
     return RidgeHead(settings).fit(fused_fit, frame_fit)
+
+
+# Predict every head for a held-out frame from its measured source effect and error.
+def predict_fold_heads(head, fused_held, frame_held):
+    return head.predict(fused_held, frame_held.source_effect.to_numpy(dtype=float),
+                        frame_held.source_se.to_numpy(dtype=float))
 
 
 
@@ -262,6 +305,34 @@ def _method_metrics(frame, prediction, config):
             'r2': _safe_r2(frame.target_effect.to_numpy(dtype=float), pred)}
 
 
+# Upper bound on R^2: target variance minus the mean reported measurement variance, or None if variance vanishes.
+def _noise_ceiling_r2(frame):
+    variance = float(np.var(frame.target_effect.to_numpy(dtype=float)))
+    noise = float(np.mean(frame.target_se.to_numpy(dtype=float) ** 2))
+    return None if variance <= 0 else float(1.0 - noise / variance)
+
+
+# Metrics for each baseline and method on both endpoints, plus paired-locus MSE gain over the train mean.
+def _baseline_report(frame, methods, baselines, config):
+    delta_frame = _delta_frame(frame)
+    source = frame.source_effect.to_numpy(dtype=float)
+    reference = np.asarray(baselines['train_mean'], dtype=float)
+    report = {'noise_ceiling_r2_target': _noise_ceiling_r2(frame), 'entries': {}}
+    for kind, group in (('baseline', baselines), ('method', methods)):
+        for name, prediction in group.items():
+            pred = np.asarray(prediction, dtype=float)
+            entry = {'kind': kind,
+                     'primary_T_endpoint': _method_metrics(frame, pred, config),
+                     'context_transfer_endpoint': _method_metrics(delta_frame, pred - source, config)}
+            if name != 'train_mean':
+                gain = paired_locus_bootstrap(frame, reference, pred, draws=1000, seed=int(config['seed']))
+                entry['mse_gain_over_train_mean'] = {
+                    'point_estimate': gain['point_estimate_mse_difference'],
+                    'ci95': gain['ci95'], 'loci': gain['loci']}
+            report['entries'][name] = entry
+    return report
+
+
 
 # Report every method on both the primary-T and context-transfer-delta endpoints.
 def evaluate_four_methods(frame, ai_prediction, rough_prediction, expert_prediction,
@@ -269,7 +340,7 @@ def evaluate_four_methods(frame, ai_prediction, rough_prediction, expert_predict
                           review_time_seconds, config, delta_predictions=None):
     methods = {
         'ai_alone': {'prediction': ai_prediction, 'reviewed': 0,
-                     'description': 'Ridge head prediction, no VPRS and no expert.'},
+                     'description': 'Direct target Ridge head with shrunk source input, no VPRS and no expert.'},
         'rough_soft_ai': {'prediction': rough_prediction, 'reviewed': 0,
                           'description': 'Ridge head with VPRS lower-bound gating.'},
         'expert_alone': {'prediction': expert_prediction,
@@ -343,13 +414,13 @@ def _locally_adaptive_conformal_width(fused_cal, residuals_cal, fused_held, k):
 
 # Fit n_members bootstrap Ridge heads and return per-held cross-member std on context_transfer.
 def _bootstrap_ridge_ensemble_disagreement(settings, fused_fit, frame_fit, fused_held,
-                                           source_held, n_members, seed):
+                                           n_members, seed):
     rng = np.random.default_rng(int(seed))
     members = []
     for _ in range(int(n_members)):
         resample = rng.integers(0, len(fused_fit), size=len(fused_fit))
         head = fit_fold_head(settings, fused_fit[resample], frame_fit.iloc[resample])
-        members.append(head.predict(fused_held, source_held)['context_transfer'])
+        members.append(head.predict_context_transfer(fused_held))
     return np.std(np.column_stack(members), axis=1)
 
 
@@ -372,28 +443,29 @@ def _block_rmse(settings, frame, avi_scores, decima_scores, track_scores, enable
     preds = np.full(len(frame), np.nan)
     for fit, held in grouped_folds(frame, folds=int(settings['folds']), seed=int(settings['seed'])):
         head = fit_fold_head(settings, fused[fit], frame.iloc[fit])
-        source_held = frame.iloc[held].source_effect.to_numpy(dtype=float)
-        preds[held] = head.predict(fused[held], source_held)['primary_T_reconstructed']
+        preds[held] = predict_fold_heads(head, fused[held], frame.iloc[held])['target']
     rmse, _ = group_rmse(frame, preds)
     return float(rmse), fusion.column_names
 
 
-# Return per-column |coef|*std attributions from the context_transfer Ridge head.
+# Return per-column standardised |coefficient| attributions from the target head.
 def _coefficient_attribution(settings, frame, avi_scores, decima_scores, track_scores,
                              enabled_blocks):
     fusion = MechanisticFusion(settings, enabled_blocks=enabled_blocks)
     fused = fusion.transform(avi_scores, decima_scores, frame, track_scores=track_scores)
+    frame = frame.copy()
+    frame['split_group'] = locus_groups(frame, gap_bp=int(settings['gap_bp']))
     head = fit_fold_head(settings, fused, frame)
-    coefs = head.models['context_transfer'].coef_
-    std = np.std(fused, axis=0)
-    importance = np.abs(coefs) * std
-    denom = importance.sum() if importance.sum() > 0 else 1.0
-    normalized = importance / denom
+    coefs = head.target_coefficients()
+    names = list(fusion.column_names) + ([RidgeHead.SOURCE_FEATURE] if head.use_source_feature else [])
+    std = np.append(np.std(fused, axis=0), head.shrunk_std)[:len(names)]
+    importance = np.abs(coefs)
+    normalized = importance / (importance.sum() if importance.sum() > 0 else 1.0)
     return [
         {'feature': name, 'coefficient': float(coefs[i]),
          'feature_std': float(std[i]), 'importance': float(importance[i]),
          'importance_fraction': float(normalized[i])}
-        for i, name in enumerate(fusion.column_names)
+        for i, name in enumerate(names)
     ]
 
 
@@ -446,7 +518,7 @@ def _feature_impact_study(settings, frame, avi_scores, decima_scores, track_scor
         'leave_one_block_out': loo,
         'configured_ablations': ablations,
         'feature_attributions': attributions,
-        'attribution_method': 'coefficient_magnitude_times_feature_std (gradient*input for Ridge)',
+        'attribution_method': 'standardised_coefficient_magnitude of the target head (fused columns + shrunk source)',
     }
 
 
@@ -490,8 +562,7 @@ def _tune_beta_on_development(settings, frame, avi_scores, decima_scores, log_pa
         for fit, held in grouped_folds(frame, folds=int(settings['folds']), seed=int(settings['seed'])):
             head = fit_fold_head(tuned_settings, fused[fit], frame.iloc[fit])
             rough = _fit_rough_soft(tuned_settings, fused[fit], frame.iloc[fit])
-            source_held = frame.iloc[held].source_effect.to_numpy(dtype=float)
-            held_pred = head.predict(fused[held], source_held)['primary_T_reconstructed']
+            held_pred = predict_fold_heads(head, fused[held], frame.iloc[held])['target']
             held_rough = rough.predict(fused[held])
             fused_pred = _rough_soft_ai_prediction(tuned_settings, held_pred, held_rough, frame.iloc[held])
             rmse, _ = group_rmse(frame.iloc[held], fused_pred)
@@ -530,6 +601,27 @@ def _expert_prediction_from_actions(frame, ai_prediction, config):
 
 
 
+# Describe a cohort too small for grouped evaluation: effect spread, class shares against the margin and noise level.
+def _descriptive_summary(frame, settings):
+    source = frame.source_effect.to_numpy(dtype=float)
+    target = frame.target_effect.to_numpy(dtype=float)
+    delta, margin = target - source, float(settings['margin'])
+    return {
+        'rows': int(len(frame)),
+        'independent_loci': int(len(set(locus_groups(frame, gap_bp=int(settings['gap_bp']))))),
+        'source_sd': float(source.std(ddof=1)), 'target_sd': float(target.std(ddof=1)),
+        'delta_sd': float(delta.std(ddof=1)),
+        'source_target_correlation': float(np.corrcoef(source, target)[0, 1]),
+        'margin': margin,
+        'share_abs_source_above_margin': float(np.mean(np.abs(source) > margin)),
+        'share_abs_target_above_margin': float(np.mean(np.abs(target) > margin)),
+        'share_abs_delta_above_margin': float(np.mean(np.abs(delta) > margin)),
+        'median_source_se': float(np.median(frame.source_se)),
+        'median_target_se': float(np.median(frame.target_se)),
+        'note': 'Too few independent loci for grouped cross-validation; reported descriptively, no model scores.',
+    }
+
+
 # Fit GroupKFold+inner-split on one held-out dataset and emit per-variant VPRS, head and cards.
 def _evaluate_held_out(settings, frame, avi_scores, decima_scores,
                        corrections_path, output_folds, log_path, track_scores=None):
@@ -541,13 +633,14 @@ def _evaluate_held_out(settings, frame, avi_scores, decima_scores,
             'rows': int(len(frame)),
             'independent_loci': int(n_loci),
             'folds_requested': int(settings['folds']),
+            'descriptive': _descriptive_summary(frame, settings),
         }
     if feasible_folds != int(settings['folds']):
         settings = {**settings, 'folds': feasible_folds}
+    frame, corrections_outcome = _apply_corrections(frame, corrections_path)
     enabled_blocks = _enabled_feature_blocks(settings, track_scores is not None)
     fusion = MechanisticFusion(settings, enabled_blocks=enabled_blocks)
     fused = fusion.transform(avi_scores, decima_scores, frame, track_scores=track_scores)
-    frame = frame.copy()
     frame['split_group'] = locus_groups(frame, gap_bp=int(settings['gap_bp']))
     n = len(frame)
     ai_pred = np.full(n, np.nan)
@@ -560,15 +653,15 @@ def _evaluate_held_out(settings, frame, avi_scores, decima_scores,
     rough_upper = np.zeros((n, len(CLASSES)))
     distance = np.full(n, np.nan)
     delta_pred = np.full(n, np.nan)
+    reconstructed_pred = np.full(n, np.nan)
+    baseline_pred = {name: np.full(n, np.nan) for name in BASELINES}
     adaptive_conformal_width = np.full(n, np.nan)
     ensemble_disagreement = np.full(n, np.nan)
     all_cards = []
-    all_applied = []
     output_folds.mkdir(parents=True, exist_ok=True)
     ub = settings['uncertainty_baselines']
     for fold, (fit, held) in enumerate(grouped_folds(frame, folds=int(settings['folds']), seed=int(settings['seed']))):
-        corrected, applied = _apply_corrections(frame, corrections_path, fit)
-        all_applied.extend(applied)
+        corrected = frame
         inner_fit_rel, calibration_rel = inner_split(
             np.arange(len(fit)), corrected.iloc[fit].split_group.to_numpy(),
             float(ub['calibration_fraction_within_fit_fold']),
@@ -577,25 +670,26 @@ def _evaluate_held_out(settings, frame, avi_scores, decima_scores,
         calibration = fit[calibration_rel]
         head = fit_fold_head(settings, fused[inner_fit], corrected.iloc[inner_fit])
         rough = _fit_rough_soft(settings, fused[fit], corrected.iloc[fit])
-        source_held = frame.iloc[held].source_effect.to_numpy(dtype=float)
-        held_head = head.predict(fused[held], source_held)
+        held_head = predict_fold_heads(head, fused[held], frame.iloc[held])
         held_rough = rough.predict(fused[held])
         for name in head_names:
             scores_full[name][held] = held_head[name]
-        ai_pred[held] = held_head['primary_T_reconstructed']
+        ai_pred[held] = held_head['target']
+        reconstructed_pred[held] = held_head['primary_T_reconstructed']
         delta_pred[held] = held_head['context_transfer']
+        for name, values in fold_baselines(corrected.iloc[inner_fit], frame.iloc[held]).items():
+            baseline_pred[name][held] = values
         rough_pred[held] = _rough_soft_ai_prediction(
-            settings, held_head['primary_T_reconstructed'], held_rough, frame.iloc[held])
+            settings, held_head['target'], held_rough, frame.iloc[held])
         accepted = held_rough['lower'].sum(axis=1) >= 1
         source_cal = corrected.iloc[calibration].source_effect.to_numpy(dtype=float)
-        cal_head = head.predict(fused[calibration], source_cal)
         cal_residuals = np.abs(
-            cal_head['context_transfer']
+            head.predict_context_transfer(fused[calibration])
             - (corrected.iloc[calibration].target_effect.to_numpy(dtype=float) - source_cal))
         adaptive_conformal_width[held] = _locally_adaptive_conformal_width(
             fused[calibration], cal_residuals, fused[held], int(ub['conformal_knn']))
         ensemble_disagreement[held] = _bootstrap_ridge_ensemble_disagreement(
-            settings, fused[fit], corrected.iloc[fit], fused[held], source_held,
+            settings, fused[fit], corrected.iloc[fit], fused[held],
             int(ub['degu_ensemble_members']), int(settings['seed']) + fold)
         rough_support[held] = held_rough['support']
         rough_lower[held] = held_rough['lower']
@@ -616,11 +710,12 @@ def _evaluate_held_out(settings, frame, avi_scores, decima_scores,
                     'distance': distance}
     return {
         'ai_prediction': ai_pred, 'rough_prediction': rough_pred,
-        'delta_prediction': delta_pred,
+        'delta_prediction': delta_pred, 'reconstructed_prediction': reconstructed_pred,
+        'baseline_predictions': baseline_pred,
         'adaptive_conformal_width': adaptive_conformal_width,
         'ensemble_disagreement': ensemble_disagreement,
         'boundary_mask': boundary_mask, 'head_scores': scores_full,
-        'rough_result': rough_result, 'cards': all_cards, 'corrections_applied': all_applied,
+        'rough_result': rough_result, 'cards': all_cards, 'corrections_applied': corrections_outcome,
         'frame_with_groups': frame,
     }
 
@@ -654,11 +749,16 @@ def _write_audit(output, config, avi_prov, decima_prov, source_paths,
         'wall_time_per_variant_seconds': wall_time_per_variant,
         'honest_limitations': [
             'Decima context tasks are not donor-matched to Ho 2025; AlphaGenome AVI is a global impact annotation rather than a cell-state-specific measurement.',
-            'The rough-soft precision parameter beta is tuned on Siraj (K562 vs HepG2), a cross-cell-type proxy for Ho/Bourges primary T. This keeps Ho/Bourges held out but means beta is optimal for Siraj biology, not Ho biology.',
+            f"The rough-soft precision parameter beta is tuned on Siraj "
+            f"({config['evaluation'].get('development_source_context', 'K562')} vs "
+            f"{config['evaluation'].get('development_target_context', 'HepG2')}), a cross-cell-type proxy for "
+            'Ho/Bourges primary T. This keeps Ho/Bourges held out but means beta is optimal for Siraj biology, not Ho biology.',
+            'Every Siraj context is transfected from one plasmid pool, so its source and target measurement errors are correlated (log plasmid depth r=0.99). Siraj cross-context R2 is therefore partly technical and reliability-disattenuated statistics do not apply; Ho and Bourges provide the independent-error estimate.',
         ],
         'design_choices_not_limitations': [
             'Foundation models are used inference-only (no fine-tuning) to keep the framework portable across backbones and isolate the contribution of the rough-soft layer.',
             'AlphaGenome contributes its frozen genome-wide AVI raw and PHRED annotations; variants without an archive match are excluded and listed in the audit.',
+            'Ho replicate measurement quality (rep_ columns) is computed and reported from the GEO normalized counts but is never a model input.',
             'Only the Ridge head and VPRS parameters are fit locally.',
         ],
         'future_work': [
@@ -671,7 +771,7 @@ def _write_audit(output, config, avi_prov, decima_prov, source_paths,
 # [1/6] Prepare dev + held-out frames with mechanistic/DHS features attached.
 def _step1_prepare_datasets(options, config):
     print('[1/6] Preparing datasets', flush=True)
-    dev_frame = _prepare_development(options.data_root, options.output)
+    dev_frame = _prepare_development(options.data_root, options.output, config)
     held_frames = _resolve_held_out(options.data_root, config, options.output)
     for name, frame in list(held_frames.items()):
         held_frames[name] = _augment_with_mechanistic(frame, options.data_root)
@@ -719,7 +819,7 @@ def _step2b_apply_sampling(all_frames, options, config, log_path):
 # [2c/6] Load AlphaGenome cell-state track NPZs (zero-fill missing rows, record status).
 def _step2c_load_tracks(options, config, all_frames, log_path):
     print('[2b/6] Loading AlphaGenome cell-state track NPZs', flush=True)
-    cell_states = tuple(config['cell_states'].keys())
+    cell_states = tuple(config['fusion'].get('track_cell_states') or config['cell_states'].keys())
     modalities = tuple(config['fusion'].get('alphagenome_track_modalities', ()))
     track_scores, track_prov = {}, {}
     t0 = time.monotonic()
@@ -728,9 +828,13 @@ def _step2c_load_tracks(options, config, all_frames, log_path):
         scores, provenance = _load_tracks_dataset(
             frame, dataset_name, options.tracks_dir, cell_states, modalities,
             require_complete=options.require_tracks)
-        track_scores[name] = scores
+        complete = provenance['status'] == 'loaded'
+        # A partially covered block would be zero-filled for the missing rows, so it is disabled instead.
+        track_scores[name] = scores if complete else None
+        provenance['block_enabled'] = bool(complete)
         track_prov[name] = provenance
-        print(f'  tracks[{name}]: {provenance["status"]}', flush=True)
+        print(f'  tracks[{name}]: {provenance["status"]} (block {"enabled" if complete else "DISABLED"}; '
+              f'{provenance["rows_loaded"]}/{provenance["rows"]} rows)', flush=True)
     tracks_seconds = time.monotonic() - t0
     log_event(log_path, 'alphagenome_tracks_loaded', seconds=tracks_seconds,
               statuses={k: v['status'] for k, v in track_prov.items()})
@@ -835,6 +939,7 @@ def _step5_held_out_evaluation(config, held_frames, avi_scores, decima_scores, t
                 'rows': result['rows'],
                 'independent_loci': result['independent_loci'],
                 'folds_requested': result['folds_requested'],
+                'descriptive': result['descriptive'],
             }
             continue
         for c in result['cards']:
@@ -871,8 +976,15 @@ def _step5_held_out_evaluation(config, held_frames, avi_scores, decima_scores, t
                                        config['evaluation']['coverage_grid'])
                   for sel, scores in selectors.items()}
         strict_lower_coverage = float(np.mean(result['rough_result']['lower'].sum(axis=1) >= 1))
+        diagnostics = _baseline_report(
+            frame_eval,
+            {'ai_alone': ai, 'rough_soft_ai': rough, 'expert_alone': expert_alone,
+             'neurojico': neurojico,
+             'ai_reconstructed_source_plus_delta': result['reconstructed_prediction']},
+            result['baseline_predictions'], config)
         held_evaluations[name] = {
             'four_methods': four,
+            'baselines_and_diagnostics': diagnostics,
             'selective_curves': curves,
             'strict_lower_coverage': strict_lower_coverage,
             'rows': int(len(frame_eval)),
@@ -885,7 +997,7 @@ def _step5_held_out_evaluation(config, held_frames, avi_scores, decima_scores, t
         write_json(output / 'expert_corrections.template.json',
                    [{'example_id': '<example_id>', 'field': 'expert_action',
                      'value': 'accept', 'reason': '<reason>',
-                     'evidence_url': 'https://doi.org/<doi>'}])
+                     'evidence_url': 'https://doi.org/<doi>', 'independent_of_labels': True}])
     return held_evaluations
 
 
@@ -938,13 +1050,39 @@ def _step6_write_outputs(options, config, output, log_path, avi_prov, decima_pro
 
 
 # Audit cohort coordinate overlap and locus counts after sampling and AVI filtering.
-def _audit_overlap(config, dev_frame, held_frames, output):
+def _audit_overlap(config, dev_frame, held_frames, output, leakage_audit=None):
     overlap_audit = _cross_dataset_overlap_audit({'siraj': dev_frame, **held_frames},
                                                  int(config['gap_bp']))
+    _, final_check = _remove_dev_rows_near_held_out(dev_frame, held_frames, int(config['gap_bp']))
+    if final_check['dev_rows_removed_near_held_out']:
+        raise RuntimeError('Sampled development rows lie within the leakage gap of held-out variants: '
+                           f'{final_check}')
+    overlap_audit['dev_held_out_leakage_guard'] = {**(leakage_audit or {}), 'final_rows_within_gap': 0}
     for name, frame in {'siraj': dev_frame, **held_frames}.items():
         groups = locus_groups(frame, gap_bp=int(config['gap_bp']))
         overlap_audit['datasets'][name]['independent_loci_after_grouping'] = int(len(set(groups)))
     write_json(output / 'cross_dataset_overlap_audit.json', overlap_audit)
+
+
+# Build the evaluated cohort: prepare, match AVI, apply the leakage guard to the full held-out sets, then sample.
+def build_cohort(options, config, log_path):
+    dev_frame, held_frames = _step1_prepare_datasets(options, config)
+    all_frames, avi_scores, avi_prov, avi_seconds, _ = _step2_load_avi(
+        options, log_path, dev_frame, held_frames)
+    full_held = {k: v for k, v in all_frames.items() if k != 'development'}
+    dev_full, leakage_audit = _remove_dev_rows_near_held_out(
+        all_frames['development'], full_held, int(config['gap_bp']))
+    log_event(log_path, 'dev_rows_removed_near_held_out', **leakage_audit)
+    frames = {'development': dev_full, **full_held}
+    coverage_audit = None
+    if (config['fusion'].get('tracks_coverage_policy', 'restrict_to_covered') == 'restrict_to_covered'
+            and 'tracks' in config['fusion'].get('feature_blocks', ())):
+        frames, coverage_audit = _restrict_to_track_covered(frames, options.tracks_dir)
+        log_event(log_path, 'sampling_frame_restricted_to_track_covered', datasets=coverage_audit)
+    all_frames, avi_scores, sampling_audit, total_rows = _step2b_apply_sampling(
+        frames, options, config, log_path)
+    sampling_audit = {**sampling_audit, 'track_coverage_restriction': coverage_audit}
+    return all_frames, avi_scores, avi_prov, avi_seconds, sampling_audit, total_rows, leakage_audit
 
 
 # Run all framework stages, including all four evaluation methods.
@@ -954,6 +1092,7 @@ def run_framework(options):
         options.output,
         protected=[options.data_root, options.avi_dir, options.tracks_dir, options.config_path],
         preserve=['prepared', 'decima_scores'],
+        archive=True,
     )
     options = _options_with_output(options, output)
     config = load_config(options.config_path)
@@ -961,16 +1100,13 @@ def run_framework(options):
     log_path = output / 'run_log.jsonl'
     log_event(log_path, 'framework_started', config_sha256=sha256(options.config_path))
 
-    dev_frame, held_frames = _step1_prepare_datasets(options, config)
-    all_frames, avi_scores, avi_prov, avi_seconds, _ = _step2_load_avi(
-        options, log_path, dev_frame, held_frames)
-    all_frames, avi_scores, sampling_audit, total_rows = _step2b_apply_sampling(
-        all_frames, options, config, log_path)
+    all_frames, avi_scores, avi_prov, avi_seconds, sampling_audit, total_rows, leakage_audit = build_cohort(
+        options, config, log_path)
     dev_frame = all_frames['development']
     held_frames = {k: v for k, v in all_frames.items() if k != 'development'}
     track_scores, track_prov, tracks_seconds = _step2c_load_tracks(
         options, config, all_frames, log_path)
-    _audit_overlap(config, dev_frame, held_frames, output)
+    _audit_overlap(config, dev_frame, held_frames, output, leakage_audit)
     decima_scores, decima_prov, decima_seconds, decima_runtime = _step3_score_decima(
         options, config, all_frames, output, log_path)
     best_beta, tuning_rows = _step4_tune_beta(

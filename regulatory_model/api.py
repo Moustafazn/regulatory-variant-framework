@@ -92,7 +92,7 @@ class RegulatoryVariantModel:
         representation = self._fusion.transform(alpha, decima, frame)
 
         assert self._head is not None and self._rough is not None
-        context_delta = self._head.models['context_transfer'].predict(representation)
+        context_delta = self._head.predict_context_transfer(representation)
         rough = self._rough.predict(representation)
         support = rough['support']
         lower = rough['lower']
@@ -115,7 +115,11 @@ class RegulatoryVariantModel:
             source = pd.to_numeric(frame['source_effect'], errors='raise').to_numpy(float)
             if not np.isfinite(source).all():
                 raise ValueError('source_effect must contain finite numeric values.')
-            result['predicted_target_effect'] = source + context_delta
+            source_se = None
+            if 'source_se' in frame:
+                source_se = pd.to_numeric(frame['source_se'], errors='raise').to_numpy(float)
+            result['predicted_target_effect'] = self._head.predict(
+                representation, source, source_se)['target']
 
         for index, class_name in enumerate(CLASSES):
             result[f'support_{class_name}'] = support[:, index]

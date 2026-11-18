@@ -14,10 +14,21 @@ import zipfile
 import numpy as np
 import pandas as pd
 import openpyxl
+from .liftover import (
+    LIFTOVER_VERSION, SOURCE_BUILDS, default_bourges_map, default_chain_path,
+    default_hg38_fasta, normalize_to_grch38,
+)
 from .reporting import write_json
 from .reporting import sha256
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+# Return the declared source build of a dataset; an explicit non-Bourges build overrides the default.
+def declared_source_build(dataset, genome_build='unverified'):
+    if dataset != 'bourges' and genome_build in ('GRCh37', 'GRCh38'):
+        return genome_build
+    return SOURCE_BUILDS[dataset]
 
 
 BASE_FEATURES = ['source_effect', 'source_se', 'ref_A', 'ref_C', 'ref_G', 'ref_T',
@@ -194,6 +205,7 @@ def prepare_bourges(root, genome_build):
     variants['allele'] = variants.allele.astype(str).str.lower()
     if not {'ref', 'alt'} <= set(variants.allele):
         raise ValueError(f'Unsupported allele labels: {variants.allele.unique()}')
+    positive_controls = set(variants.loc[variants.elementID.astype(str).str.startswith('PosCtrl'), 'rsID'])
     counts = variants.groupby(['rsID', 'elementTag', 'allele'])[sample_cols].sum()
     scaled = counts.div(library_sizes, axis=1) * 1e6
     dna = scaled[[f'v{i}' for i in range(1, 5)]].mean(axis=1)
@@ -225,6 +237,7 @@ def prepare_bourges(root, genome_build):
             continue
         records.append(dict(example_id=f'Bourges2020:{rsid}', variant_id=f'{chrom}:{position}:{ref}:{alt}',
                             rsid=rsid, chrom=chrom, position=position, ref=ref, alt=alt, genome_build=genome_build,
+                            is_positive_control=rsid in positive_controls,
                             source_context='primary_T_resting', target_context='primary_T_stimulated', dataset='Bourges2020',
                             source_effect=source.mean(), target_effect=target.mean(),
                             source_se=source.std(ddof=1) / np.sqrt(12), target_se=target.std(ddof=1) / np.sqrt(12),
@@ -287,42 +300,35 @@ def prepare_dataset(dataset, root, output, source_context='K562', target_context
     targets = Path(str(output) + '.targets.csv.gz')
     report_path = Path(str(output) + '.json')
     source_shas = {name: sha256(root / name) for name in adapter.inputs}
+    source_build = declared_source_build(dataset, genome_build)
     if all(p.is_file() for p in (output, inputs, targets, report_path)):
         prior = json.loads(report_path.read_text())
-        prior_liftover_applied = bool(
-            isinstance(prior.get('liftover_to_grch38'), dict)
-            and prior['liftover_to_grch38'].get('applied'))
+        prior_liftover = prior.get('liftover_to_grch38')
+        prior_liftover = prior_liftover if isinstance(prior_liftover, dict) else {}
+        # The cached contexts must match the requested ones, or changing the pair would silently reuse stale data.
+        requested_pair = {'source_context': source_context, 'target_context': target_context}
+        pair_matches = (not adapter.options
+                        or 'source_context' not in adapter.options
+                        or any({'source_context': p.get('source_context'),
+                                'target_context': p.get('target_context')} == requested_pair
+                               for p in prior.get('context_pairs') or ()))
         if prior.get('status') == 'validated' \
                 and prior.get('source_files_sha256') == source_shas \
-                and prior.get('context_pairs') and prior.get('rows') \
-                and prior_liftover_applied:
+                and prior.get('context_pairs') and prior.get('rows') and pair_matches \
+                and prior_liftover.get('version') == LIFTOVER_VERSION \
+                and prior_liftover.get('declared_source_build') == source_build:
             print(f'Reusing prepared and validated {prior["rows"]:,} examples at {output}', flush=True)
             return PreparedData(output, inputs, targets, report_path, int(prior['rows']))
     options = dict(source_context=source_context, target_context=target_context, genome_build=genome_build)
     raw = adapter.reader(root, **{name: options[name] for name in adapter.options})
-    # Normalize every variant to GRCh38 and verify against the hg38 FASTA Decima reads.
-    # Without this step 73-77% of ref alleles disagree with the FASTA (see
-    # regulatory_model/liftover.py docstring for the empirical mismatch counts), which
-    # silently drives Decima to score the wrong reference base. Rows that cannot be
-    # reconciled are dropped and recorded in the dataset report rather than skewing
-    # downstream features.
-    from .liftover import normalize_to_grch38, default_chain_path, default_hg38_fasta
-    hg38_fasta = default_hg38_fasta(PROJECT_ROOT)
-    chain = default_chain_path(PROJECT_ROOT)
-    liftover_provenance = {'applied': False, 'reason': 'hg38_fasta_absent'}
-    if hg38_fasta.is_file():
-        raw, liftover_provenance = normalize_to_grch38(raw, hg38_fasta, chain)
-        liftover_provenance['applied'] = True
-        print(f'  liftover[{dataset}]: '
-              f'{liftover_provenance["normalized_rows"]}/'
-              f'{liftover_provenance["input_rows"]} variants verified against hg38 '
-              f'({liftover_provenance["dropped_rows"]} dropped as unresolvable); '
-              f'mapping_methods={liftover_provenance["mapping_method_counts"]}',
-              flush=True)
-    else:
-        print(f'  liftover[{dataset}]: SKIPPED (no hg38 FASTA at '
-              f'{hg38_fasta}); variants will be scored on their declared coordinates.',
-              flush=True)
+    # Lift from the declared source build and verify every row against the hg38 FASTA Decima reads.
+    raw, liftover_provenance = normalize_to_grch38(
+        raw, default_hg38_fasta(PROJECT_ROOT), default_chain_path(PROJECT_ROOT), source_build,
+        default_bourges_map(PROJECT_ROOT))
+    print(f'  liftover[{dataset}]: {liftover_provenance["normalized_rows"]}/'
+          f'{liftover_provenance["input_rows"]} variants verified against hg38 '
+          f'({liftover_provenance["dropped_rows"]} dropped: {liftover_provenance["dropped_reason_counts"]}); '
+          f'methods={liftover_provenance["mapping_method_counts"]}', flush=True)
     frame = validate_frame(raw)
     features = feature_columns(frame)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -367,6 +373,24 @@ SOURCE_COLUMNS = ['A_log2FC', 'B_log2FC', 'A_log2FC_SE', 'B_log2FC_SE']
 def numeric(frame, columns):
     # Convert documented Excel missing cells while rejecting unexpected text.
     return frame[columns].replace('#N/A', np.nan).apply(pd.to_numeric, errors='raise')
+
+_REPLICATE_CACHE = {}
+
+
+def merge_ho_replicate_quality(root, frame):
+    # Attach report-only replicate measurement quality from the GEO normalized counts; rep_ columns are never model inputs.
+    from .replicates import REPLICATE_COLUMNS, replicate_quality
+    path = Path(root) / 'ho_normalized_counts.txt.gz'
+    if not path.is_file():
+        raise FileNotFoundError(f'Missing Ho replicate counts: {path}')
+    if str(path) not in _REPLICATE_CACHE:
+        _REPLICATE_CACHE[str(path)] = replicate_quality(path)
+    table, provenance = _REPLICATE_CACHE[str(path)]
+    frame = frame.drop(columns=[c for c in REPLICATE_COLUMNS if c in frame], errors='ignore')
+    frame = frame.merge(table, on='variant_id', how='left', validate='many_to_one')
+    frame.attrs['replicate_quality_provenance'] = provenance
+    return frame
+
 
 def merge_ho_mechanistic_features(root, frame):
     # Attach Ho's own mechanistic predictors from supplementary sheets 4 (annotations), 10 and 12 (motifbreakR); predictors only, never target-derived fields.

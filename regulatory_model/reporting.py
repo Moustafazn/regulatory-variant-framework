@@ -51,9 +51,8 @@ def platform_metadata():
     return {'python': platform.python_version(), 'platform': platform.platform(), 'versions': versions}
 
 
-def prepare_output(output, protected=(), preserve=()):
-    # Clear the output directory while refusing to touch protected input paths.
-    # Entries whose basename is listed in ``preserve`` are kept across runs.
+def prepare_output(output, protected=(), preserve=(), archive=False):
+    # Clear the output directory (or move it to <parent>/_archive/<name>/<UTC stamp> when archive=True), keeping ``preserve`` entries and refusing protected paths.
     output = Path(output).resolve()
     protected = {Path(p).resolve() for p in protected if p is not None}
     for guard in protected:
@@ -62,10 +61,22 @@ def prepare_output(output, protected=(), preserve=()):
     preserve = {str(name) for name in preserve}
     if output.exists():
         import shutil
-        for child in output.iterdir():
-            if child.name in preserve:
-                continue
-            if child.is_dir() and not child.is_symlink():
+        stale = [child for child in output.iterdir() if child.name not in preserve]
+        destination = None
+        if archive and stale:
+            from datetime import datetime, timezone
+            stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+            root = output.parent / '_archive' / output.name
+            destination = root / stamp
+            counter = 1
+            while destination.exists():
+                destination = root / f'{stamp}-{counter}'
+                counter += 1
+            destination.mkdir(parents=True)
+        for child in stale:
+            if destination is not None:
+                shutil.move(str(child), str(destination / child.name))
+            elif child.is_dir() and not child.is_symlink():
                 shutil.rmtree(child)
             else:
                 child.unlink()

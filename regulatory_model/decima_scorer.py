@@ -2,16 +2,21 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import json
 import os
+import shutil
 import sys
 import tempfile
 import warnings
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from .data_prep import PROJECT_ROOT
+from .liftover import LIFTOVER_VERSION
 
 
 # Wrap Decima's load_decima_model + predict_variant_effect with device, cache, and tasks resolution.
@@ -256,7 +261,7 @@ class DecimaGeneScorer:
             self._propagate_train_param('pin_memory', bool(self.settings['pin_memory']))
 
 
-    # Score every variant in ``frame`` and return (per-state scores, provenance).
+    # Score every variant in ``frame`` and return (per-state scores, provenance); only uncached hg38 variants reach Decima.
     def score(self, frame, dataset_name=None, cache_dir=None):
         try:
             from decima import predict_variant_effect  # type: ignore
@@ -264,13 +269,15 @@ class DecimaGeneScorer:
             raise RuntimeError(
                 'decima package not installed. Install with `pip install decima`.'
             ) from exc
-        df_variant = pd.DataFrame({
-            'chrom': ['chr' + str(c).lstrip('chr') for c in frame.chrom],
-            'pos':   frame.position.astype(int).to_numpy(),
-            'ref':   frame.ref.astype(str).to_numpy(),
-            'alt':   frame.alt.astype(str).to_numpy(),
-            'variant_id': frame.variant_id.astype(str).to_numpy(),
+        df_all = pd.DataFrame({
+            'chrom': ['chr' + str(c).removeprefix('chr') for c in frame.chrom],
+            'pos': frame.position.astype(int).to_numpy(),
+            'ref': frame.ref.astype(str).to_numpy(),
+            'alt': frame.alt.astype(str).to_numpy(),
         })
+        df_all['variant_id'] = (df_all.chrom + ':' + df_all.pos.astype(str) + ':'
+                                + df_all.ref + ':' + df_all.alt)
+        keys = df_all.variant_id.to_numpy()
         per_state, per_state_prov = {}, {}
         workers = self._num_workers()
         batch_size = int(self.settings.get('batch_size', 1))
@@ -279,88 +286,70 @@ class DecimaGeneScorer:
         reference_cache = bool(self.settings.get('reference_cache', True))
         from decima.data.dataset import VariantDataset
         metadata_columns = set(VariantDataset.DEFAULT_COLUMNS) | {'variant_id'}
+        retired = self._retire_legacy_files(cache_dir)
         with tempfile.TemporaryDirectory(prefix='neurojico-decima-') as temporary_dir:
             model_ready = False
             for state_name in self.cell_states:
-                cached = self._load_cached_state(cache_dir, dataset_name, state_name,
-                                                 df_variant.variant_id.tolist())
-                if cached is not None:
-                    per_state[state_name] = cached.reshape(-1, 1)
-                    per_state_prov[state_name] = {'status': 'reused_from_cache',
-                                                  'variants_scored': int(len(cached))}
-                    print(f'  decima[{state_name}]: reused {len(cached)} cached scores for '
-                          f'{dataset_name!r}', flush=True)
-                    continue
                 stanza = self._task_queries[state_name]
                 task_query = stanza['query']
-                task_names = self._resolve_task_query(task_query)
-                if not task_names:
-                    if stanza['on_missing'] == 'fail':
-                        raise RuntimeError(
-                            f"Decima has no matching tasks for cell_state {state_name!r} "
-                            f"(query {task_query!r}). Fix the query in "
-                            "config.secondary.task_queries, or set on_missing to 'proxy_zero' "
-                            "with an explicit proxy label if a declared zero-fill is intended.")
-                    proxy_label = stanza['proxy'] or 'proxy_zero'
-                    print(f'  decima[{state_name}]: proxy_zero ({proxy_label!r}) for '
-                          f'query {task_query!r}; {len(df_variant)} variants set to 0.0 '
-                          f'as declared in config.secondary.task_queries.', flush=True)
-                    values = np.zeros(len(df_variant), dtype=np.float32)
-                    per_state[state_name] = values.reshape(-1, 1)
-                    per_state_prov[state_name] = {
-                        'status': 'proxy_zero',
-                        'proxy': proxy_label,
-                        'proxy_note': stanza['note'],
-                        'task_query': task_query,
-                        'variants_scored': int(len(df_variant)),
-                    }
-                    self._save_cached_state(cache_dir, dataset_name, state_name,
-                                            df_variant.variant_id.tolist(), values)
-                    continue
-                if not model_ready:
+                store = self._load_store(cache_dir, state_name)
+                todo = (df_all.loc[~pd.Series(keys).isin(store.index).to_numpy()]
+                        .drop_duplicates('variant_id').reset_index(drop=True))
+                reused = int(len(set(keys)) - len(todo))
+                task_names = ()
+                if len(todo):
+                    task_names = self._resolve_task_query(task_query)
+                    if not task_names:
+                        if stanza['on_missing'] == 'fail':
+                            raise RuntimeError(
+                                f"Decima has no matching tasks for cell_state {state_name!r} "
+                                f"(query {task_query!r}). Fix the query in "
+                                "config.secondary.task_queries, or set on_missing to 'proxy_zero' "
+                                "with an explicit proxy label if a declared zero-fill is intended.")
+                        proxy_label = stanza['proxy'] or 'proxy_zero'
+                        print(f'  decima[{state_name}]: proxy_zero ({proxy_label!r}) for '
+                              f'query {task_query!r}; {len(df_all)} variants set to 0.0 '
+                              f'as declared in config.secondary.task_queries.', flush=True)
+                        per_state[state_name] = np.zeros((len(df_all), 1), dtype=np.float32)
+                        per_state_prov[state_name] = {
+                            'status': 'proxy_zero', 'proxy': proxy_label,
+                            'proxy_note': stanza['note'], 'task_query': task_query,
+                            'variants_scored': int(len(df_all))}
+                        continue
+                    if not model_ready:
+                        with self._quiet_decima_output():
+                            self._ensure_model()
+                        model_ready = True
+                    output_path = Path(temporary_dir) / f'{state_name}.parquet'
                     with self._quiet_decima_output():
-                        self._ensure_model()
-                    model_ready = True
-                output_path = Path(temporary_dir) / f'{state_name}.parquet'
-                with self._quiet_decima_output():
-                    predict_variant_effect(
-                        df_variant, output_pq=str(output_path),
-                        tasks=task_query, model=self._model,
-                        device=self._resolve_lightning_device_for_trainer(),
-                        num_workers=workers, batch_size=batch_size, chunksize=chunksize,
-                        float_precision=float_precision, reference_cache=reference_cache,
-                        include_cols=['variant_id'])
-                self._release_device_memory()
-                predictions = pd.read_parquet(output_path)
-                task_columns = [c for c in predictions.columns if c not in metadata_columns]
-                if not task_columns:
-                    raise RuntimeError(
-                        f'Decima parquet for {state_name} has no task-prediction columns; '
-                        f'got {list(predictions.columns)}.')
-                predictions['_mean_effect'] = predictions[task_columns].mean(axis=1)
-                per_variant_mean = predictions.groupby('variant_id')['_mean_effect'].mean()
-                missing = sorted(set(df_variant.variant_id) - set(per_variant_mean.index))
-                if missing:
-                    print(f'  decima[{state_name}]: no gene overlap for {len(missing)}/'
-                          f'{len(df_variant)} variants ({len(missing)/len(df_variant):.1%}); '
-                          f'these are set to 0.0 so downstream features stay dense '
-                          f'(examples: {missing[:3]})', flush=True)
-                per_variant_mean = per_variant_mean.reindex(df_variant.variant_id).fillna(0.0)
-                values = per_variant_mean.to_numpy(dtype=np.float32)
+                        predict_variant_effect(
+                            todo[['chrom', 'pos', 'ref', 'alt', 'variant_id']], output_pq=str(output_path),
+                            tasks=task_query, model=self._model,
+                            device=self._resolve_lightning_device_for_trainer(),
+                            num_workers=workers, batch_size=batch_size, chunksize=chunksize,
+                            float_precision=float_precision, reference_cache=reference_cache,
+                            include_cols=['variant_id'])
+                    self._release_device_memory()
+                    self._save_raw_output(cache_dir, dataset_name, state_name, output_path)
+                    store = self._append_to_store(cache_dir, state_name, store, todo, output_path,
+                                                  metadata_columns)
+                values = store.loc[keys, 'score'].to_numpy(dtype=np.float32)
+                overlap = store.loc[keys, 'gene_overlap'].to_numpy(dtype=bool)
                 if not np.isfinite(values).all():
                     raise RuntimeError(f'Decima returned nonfinite scores for {state_name}.')
                 per_state[state_name] = values.reshape(-1, 1)
                 per_state_prov[state_name] = {
-                    'status': 'scored', 'task_query': task_query,
-                    'task_count': len(task_names),
-                    'variants_scored': int(len(df_variant)),
-                    'variants_with_gene_overlap': int(len(df_variant) - len(missing)),
-                    'variants_without_gene_overlap': int(len(missing)),
-                    'gene_overlap_fraction': float(1.0 - len(missing) / max(1, len(df_variant))),
-                    'examples_without_gene_overlap': missing[:5],
+                    'status': 'scored' if reused == 0 else (
+                        'reused_from_cache' if not len(todo) else 'scored_incremental'),
+                    'task_query': task_query, 'task_count': len(task_names) or None,
+                    'variants_scored': int(len(todo)), 'variants_reused_from_cache': reused,
+                    'variants_with_gene_overlap': int(overlap.sum()),
+                    'variants_without_gene_overlap': int((~overlap).sum()),
+                    'gene_overlap_fraction': float(overlap.mean()),
+                    'legacy_files_retired': retired,
                 }
-                self._save_cached_state(cache_dir, dataset_name, state_name,
-                                        df_variant.variant_id.tolist(), values)
+                print(f'  decima[{state_name}]: {len(todo)} scored, {reused} reused for '
+                      f'{dataset_name!r}', flush=True)
         return per_state, {
             'model_identifier': self.settings.get('model_identifier', 'ensemble'),
             'variants_scored': int(len(frame)),
@@ -384,28 +373,107 @@ class DecimaGeneScorer:
         except Exception:  # noqa: BLE001
             return ()
 
-    # Return the parquet path used to cache a (dataset, state) scoring result.
+    # Return the settings that define what a stored score means; any change invalidates the store.
+    def _store_signature(self, state_name):
+        payload = {'model_identifier': self.settings.get('model_identifier', 'ensemble'),
+                   'task_query': self._task_queries[state_name]['query'],
+                   'liftover_version': LIFTOVER_VERSION,
+                   'aggregation': 'mean_over_tasks_then_mean_over_gene_rows'}
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest(), payload
+
+    # Return the per-state store paths (scores parquet and its signature sidecar), or (None, None) without a cache dir.
     @staticmethod
-    def _cache_path(cache_dir, dataset_name, state_name):
-        if cache_dir is None or dataset_name is None:
-            return None
-        return Path(cache_dir) / f'decima_{dataset_name}_{state_name}.parquet'
+    def _store_paths(cache_dir, state_name):
+        if cache_dir is None:
+            return None, None
+        base = Path(cache_dir) / f'decima_store_{state_name}'
+        return base.with_suffix('.parquet'), base.with_suffix('.signature.json')
 
-    # Load a previously cached (dataset, state) score vector if the variant_id list matches exactly.
-    def _load_cached_state(self, cache_dir, dataset_name, state_name, expected_ids):
-        path = self._cache_path(cache_dir, dataset_name, state_name)
+    # Return an empty store frame indexed by hg38 variant key.
+    @staticmethod
+    def _empty_store():
+        index = pd.Index([], name='variant_id', dtype=object)
+        return pd.DataFrame({'score': pd.Series([], dtype='float32'),
+                             'gene_overlap': pd.Series([], dtype=bool),
+                             'source': pd.Series([], dtype=object)}, index=index)
+
+    # Load a state's score store; a store written under different settings is moved to _stale/ and ignored.
+    def _load_store(self, cache_dir, state_name):
+        path, sidecar = self._store_paths(cache_dir, state_name)
         if path is None or not path.is_file():
-            return None
-        cached = pd.read_parquet(path)
-        if list(cached['variant_id']) != list(expected_ids):
-            return None
-        return cached['score'].to_numpy(dtype=np.float32)
+            return self._empty_store()
+        signature, _ = self._store_signature(state_name)
+        recorded = json.loads(sidecar.read_text()).get('signature') if sidecar.is_file() else None
+        if recorded != signature:
+            self._move_to_stale(path, sidecar)
+            return self._empty_store()
+        store = pd.read_parquet(path).set_index('variant_id')
+        if store.index.duplicated().any():
+            raise RuntimeError(f'Decima store {path} contains duplicate variant keys.')
+        return store
 
-    # Persist a (dataset, state) score vector to the parquet cache.
-    def _save_cached_state(self, cache_dir, dataset_name, state_name, variant_ids, values):
-        path = self._cache_path(cache_dir, dataset_name, state_name)
+    # Move a cache file and its sidecar into _stale/ with a timestamp; nothing is ever deleted.
+    @staticmethod
+    def _move_to_stale(*paths):
+        stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        for path in paths:
+            if path is not None and Path(path).is_file():
+                stale = Path(path).parent / '_stale'
+                stale.mkdir(exist_ok=True)
+                shutil.move(str(path), str(stale / f'{Path(path).stem}.{stamp}{Path(path).suffix}'))
+
+    # Write the store and its signature sidecar atomically.
+    def _write_store(self, cache_dir, state_name, store):
+        path, sidecar = self._store_paths(cache_dir, state_name)
         if path is None:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame({'variant_id': variant_ids,
-                      'score': values}).to_parquet(path, index=False)
+        signature, payload = self._store_signature(state_name)
+        temporary = path.with_name(path.name + '.partial')
+        store.reset_index().to_parquet(temporary, index=False)
+        temporary.replace(path)
+        sidecar.write_text(json.dumps({'signature': signature, 'settings': payload, 'rows': int(len(store))}))
+
+    # Aggregate Decima's per-gene, per-task output into one score per variant and append it to the store.
+    def _append_to_store(self, cache_dir, state_name, store, todo, output_path, metadata_columns):
+        predictions = pd.read_parquet(output_path)
+        task_columns = [c for c in predictions.columns if c not in metadata_columns]
+        if not task_columns:
+            raise RuntimeError(f'Decima parquet for {state_name} has no task-prediction columns; '
+                               f'got {list(predictions.columns)}.')
+        predictions['_mean_effect'] = predictions[task_columns].mean(axis=1)
+        per_variant = predictions.groupby('variant_id')['_mean_effect'].mean()
+        scored = pd.DataFrame({'score': per_variant.reindex(todo.variant_id).fillna(0.0).to_numpy(dtype=np.float32),
+                               'gene_overlap': todo.variant_id.isin(per_variant.index).to_numpy(),
+                               'source': 'decima_scored'}, index=pd.Index(todo.variant_id.to_numpy(), name='variant_id'))
+        if not np.isfinite(scored.score.to_numpy()).all():
+            raise RuntimeError(f'Decima returned nonfinite scores for {state_name}.')
+        missing = int((~scored.gene_overlap).sum())
+        if missing:
+            print(f'  decima[{state_name}]: no gene overlap for {missing}/{len(scored)} new variants; '
+                  'set to 0.0 and flagged gene_overlap=False.', flush=True)
+        store = pd.concat([store, scored])
+        self._write_store(cache_dir, state_name, store)
+        return store
+
+    # Move pre-store cache files (keyed by variant_id, scored before the liftover fix) into _stale/.
+    def _retire_legacy_files(self, cache_dir):
+        if cache_dir is None or not Path(cache_dir).is_dir():
+            return []
+        retired = []
+        for path in sorted(Path(cache_dir).glob('decima_*.parquet')) + sorted(Path(cache_dir).glob('decima_*.signature.json')):
+            if path.name.startswith('decima_store_') or path.name.startswith('decima_raw_'):
+                continue
+            self._move_to_stale(path)
+            retired.append(path.name)
+        return retired
+
+    # Keep Decima's raw per-gene, per-task output so other aggregations need no rescoring.
+    @staticmethod
+    def _save_raw_output(cache_dir, dataset_name, state_name, output_path):
+        if cache_dir is None or dataset_name is None:
+            return
+        raw_dir = Path(cache_dir) / 'raw'
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+        shutil.copyfile(output_path, raw_dir / f'decima_raw_{dataset_name}_{state_name}.{stamp}.parquet')

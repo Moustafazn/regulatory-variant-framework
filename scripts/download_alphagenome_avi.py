@@ -500,6 +500,11 @@ def prepare_bourges_map(args, reference):
     if missing:
         raise ValueError(f'Prepared Bourges data is missing columns: {sorted(missing)}')
     path = args.bourges_map
+    if frame.genome_build.eq('GRCh38').all():
+        # The prepared table was already lifted through this map; rebuilding from hg38 positions would destroy it.
+        if not path.is_file():
+            raise FileNotFoundError(f'Prepared Bourges data is GRCh38 but its coordinate map is missing: {path}')
+        return
     inputs = {
         'version': BOURGES_MAP_VERSION,
         'prepared_sha256': sha256(source),
@@ -577,7 +582,7 @@ def prepare_dataset(name, args, reference):
     frame['alt'] = frame.alt.str.upper()
     snv = frame.ref.isin(list('ACGT')) & frame.alt.isin(list('ACGT')) & frame.ref.ne(frame.alt)
     mappings = {}
-    if name == 'bourges':
+    if name == 'bourges' and not frame.genome_build.eq('GRCh38').all():
         report = json.loads(args.bourges_map.read_text())
         if report['inputs']['prepared_sha256'] != sha256(source):
             raise ValueError('Bourges coordinate map does not match its prepared input.')
@@ -603,7 +608,7 @@ def prepare_dataset(name, args, reference):
         if snv.iat[i]:
             chrom, position, ref, alt = chromosome(row.chrom), int(row.position), row.ref, row.alt
             strand, swapped = '+', False
-            if name == 'bourges':
+            if name == 'bourges' and mappings:
                 mapping = mappings.get(row.example_id, {})
                 if mapping.get('status') != 'ready':
                     out['status'] = 'unmapped'
