@@ -1,33 +1,17 @@
 [project]
 name = "regulatory-variant-framework"
-version = "1.0.0"
-description = "Context-dependent regulatory variant interpretation with integrated molecular evidence, uncertainty, and expert review"
+version = "2.0.0"
+description = "Reproducible immune-cell regulatory variant transfer and review-prioritization benchmark"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "numpy>=1.26,<3",
-  "pandas>=2.2,<4",
-  "scipy>=1.12,<2",
-  "scikit-learn>=1.5,<2",
-  "openpyxl>=3.1,<4",
-  "pydantic>=2.9,<3",
-  "joblib>=1.4,<2",
-  "truststore>=0.10.4",
-  # Foundational models
-  "huggingface_hub>=0.26",
-  "torch>=2.4,<3",
-  # Decima (installed from PyPI as decima; HF weights downloaded at runtime)
-  "decima>=0.5",
-  # Genome-build normalisation (GRCh37 -> GRCh38 lift-over + hg38 FASTA verification
-  # for every variant before Decima scoring). pyfaidx is also a transitive dep of
-  # genomepy/decima; declared here because regulatory_model.liftover imports it directly.
-  "pyliftover>=0.4,<1",
-  "pyfaidx>=0.8,<1",
+  "numpy>=2.0,<3", "pandas>=2.2,<3", "scipy>=1.12,<2", "scikit-learn>=1.5,<2",
+  "openpyxl>=3.1,<4", "joblib>=1.4,<2", "pyliftover>=0.4,<1", "pyfaidx>=0.8,<1",
+  "pyBigWig>=0.3.22,<1", "matplotlib>=3.9,<4", "certifi>=2024.2.2"
 ]
 
 [project.optional-dependencies]
 test = ["pytest>=8,<10"]
-alphagenome = ["alphagenome>=0.7"]
 
 [project.scripts]
 regulatory-variants = "main:main"

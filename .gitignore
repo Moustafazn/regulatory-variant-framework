@@ -1,5 +1,6 @@
 /output/
 /data/
+/backups/
 .idea
 /venv
 /scripts/output/
@@ -14,5 +15,4 @@ __pycache__/
 .env
 .env.*
 !.env.example
-/output-old/
-docs/regulatory_variant_proposal.md
+/paper

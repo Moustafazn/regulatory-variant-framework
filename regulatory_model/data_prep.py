@@ -1,34 +1,10 @@
-"""Load, audit and prepare real MPRA data and biological evidence."""
+"""Ho immune-cell assay preparation; explicit endpoint and predictor whitelists."""
 from pathlib import Path
-import sys
-if __package__ in (None, ''):
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    __package__ = 'regulatory_model'
-from pathlib import Path
-from dataclasses import dataclass
-import argparse
-import gzip
-import json
-import re
-import zipfile
 import numpy as np
 import pandas as pd
 import openpyxl
-from .liftover import (
-    LIFTOVER_VERSION, SOURCE_BUILDS, default_bourges_map, default_chain_path,
-    default_hg38_fasta, normalize_to_grch38,
-)
-from .reporting import write_json
-from .reporting import sha256
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-
-# Return the declared source build of a dataset; an explicit non-Bourges build overrides the default.
-def declared_source_build(dataset, genome_build='unverified'):
-    if dataset != 'bourges' and genome_build in ('GRCh37', 'GRCh38'):
-        return genome_build
-    return SOURCE_BUILDS[dataset]
 
 
 BASE_FEATURES = ['source_effect', 'source_se', 'ref_A', 'ref_C', 'ref_G', 'ref_T',
@@ -38,20 +14,13 @@ BASE_FEATURES = ['source_effect', 'source_se', 'ref_A', 'ref_C', 'ref_G', 'ref_T
 SEQUENCE_FEATURES = ['ref_gc', 'alt_gc', 'gc_delta', 'ref_cpg', 'alt_cpg']
 
 
-DHS = ['dhs_hTH1', 'dhs_hTH17', 'dhs_hTH2', 'dhs_CD4', 'dhs_CD4pos_N',
-       'dhs_hTR', 'dhs_Jurkat', 'dhs_CD8']
-
-
-# Mechanistic predictors derived from Ho's own supplementary workbook (sheet 4 for delta_svm_nCD4 and DHS; sheets 10 and 12 for motifbreakR per-variant allele difference).
+# Whitelisted molecular predictors from Ho supplementary sheets 4, 10 and 12.
 MECHANISTIC_FEATURES = ['delta_svm_nCD4', 'motifbreakr_tcell_alleleDiff_max', 'motifbreakr_tcell_alleleDiff_min',
                         'motifbreakr_jurkat_alleleDiff_max', 'motifbreakr_jurkat_alleleDiff_min',
                         'motifbreakr_tcell_tf_count', 'motifbreakr_jurkat_tf_count']
 
 
-ALLOWED_FEATURES = BASE_FEATURES + SEQUENCE_FEATURES + DHS
-
-
-OUTCOMES = ['target_effect', 'target_se', 'effect_covariance']
+ALLOWED_FEATURES = BASE_FEATURES + SEQUENCE_FEATURES + MECHANISTIC_FEATURES
 
 
 def read_sheet(workbook, name):
@@ -67,16 +36,6 @@ def add_alleles(frame):
         for base in 'ACGT':
             frame[f'{side}_{base}'] = (frame[side].str.upper() == base).astype(float)
     frame['length_delta'] = frame.alt.str.len() - frame.ref.str.len()
-    return frame
-
-
-def add_sequences(frame, reference, alternate):
-    # Derive simple sequence composition features from experimentally supplied oligos.
-    for prefix, sequences in [('ref', reference), ('alt', alternate)]:
-        seq = sequences.str.upper()
-        frame[prefix + '_gc'] = (seq.str.count('G') + seq.str.count('C')) / seq.str.len()
-        frame[prefix + '_cpg'] = seq.str.count('CG') / seq.str.len()
-    frame['gc_delta'] = frame.alt_gc - frame.ref_gc
     return frame
 
 
@@ -124,11 +83,10 @@ def validate_frame(frame):
 
 
 def prepare_ho(root):
-    # Join paired published Ho effects and whitelist independent DHS annotations.
+    # Join paired published allelic effects; preserve the full quantitative cohort.
     workbook = openpyxl.load_workbook(Path(root) / 'ho_supp.xlsx', read_only=True, data_only=True)
     target = read_sheet(workbook, '1. Tcell MPRA results')
     source = read_sheet(workbook, '9. jurkat MPRA results')
-    annotation = read_sheet(workbook, '4. MPRA Functional Annotations')
     workbook.close()
     paired = target.merge(source, on='SNP19', suffixes=('_T', '_J'), validate='one_to_one')
     if ((paired.ref_allele_T != paired.ref_allele_J) | (paired.alt_allele_T != paired.alt_allele_J)).any():
@@ -140,9 +98,7 @@ def prepare_ho(root):
                           'source_effect': paired.Log2Skew_J, 'source_se': paired.Skew_SE_J,
                           'target_effect': paired.Log2Skew_T, 'target_se': paired.Skew_SE_T,
                           'source_context': 'Jurkat', 'target_context': 'primary_T', 'dataset': 'Ho2025'})
-    frame = frame.merge(annotation[['SNP19'] + DHS].rename(columns={'SNP19': 'variant_id'}),
-                        on='variant_id', validate='one_to_one')
-    for column in ['source_effect', 'source_se', 'target_effect', 'target_se'] + DHS:
+    for column in ['source_effect', 'source_se', 'target_effect', 'target_se']:
         frame[column] = pd.to_numeric(frame[column], errors='coerce')
     keep = np.isfinite(frame[['source_effect', 'source_se', 'target_effect', 'target_se']]).all(axis=1)
     keep &= (frame.source_se > 0) & (frame.target_se > 0)
@@ -152,244 +108,6 @@ def prepare_ho(root):
     frame['example_id'] = 'Ho2025:' + frame.variant_id
     return validate_frame(add_alleles(frame))
 
-
-def prepare_siraj(root, source_context, target_context, genome_build):
-    # Read two Siraj contexts and retain one prespecified file-order window per variant.
-    tables = []
-    with zipfile.ZipFile(Path(root) / 'siraj_MPRA.zip') as archive:
-        for context in [source_context, target_context]:
-            files = sorted(n for n in archive.namelist() if '/DE/' in n and f'_{context}_' in n and n.endswith('.gz'))
-            if not files:
-                raise ValueError(f'No Siraj files for {context}')
-            pieces = []
-            for name in files:
-                with gzip.open(archive.open(name), 'rt') as stream:
-                    part = pd.read_csv(stream, sep='\t', low_memory=False)
-                    part = part[(part.window == 'center') & (part.strand == 'fwd') & (part.haplotype == 'ref')].copy()
-                    part['archive_member'] = name
-                    pieces.append(part)
-            table = pd.concat(pieces, ignore_index=True)
-            key = 'SNP' if 'SNP' in table else 'SNP19'
-            table['variant_id'] = table[key].astype(str).str.removeprefix('chr')
-            table = table[table.variant_id.str.fullmatch(r'(?:[0-9]+|X|Y):[0-9]+:[ACGT]+:[ACGT]+')]
-            for col in ['Log2Skew', 'Skew_SE']:
-                table[col] = pd.to_numeric(table[col], errors='coerce')
-            table = table[np.isfinite(table.Log2Skew) & np.isfinite(table.Skew_SE) & (table.Skew_SE > 0)]
-            # File order fixes duplicate resolution without selecting by measured outcome.
-            table = table.sort_values(['variant_id', 'archive_member']).drop_duplicates('variant_id')
-            tables.append(table[['variant_id', 'Log2Skew', 'Skew_SE']])
-    paired = tables[0].merge(tables[1], on='variant_id', suffixes=('_source', '_target'), validate='one_to_one')
-    parts = paired.variant_id.str.split(':', expand=True)
-    frame = pd.DataFrame({'variant_id': paired.variant_id, 'chrom': parts[0], 'position': parts[1].astype(int),
-                          'ref': parts[2], 'alt': parts[3], 'genome_build': genome_build,
-                          'source_effect': paired.Log2Skew_source, 'source_se': paired.Skew_SE_source,
-                          'target_effect': paired.Log2Skew_target, 'target_se': paired.Skew_SE_target,
-                          'source_context': source_context, 'target_context': target_context, 'dataset': 'Siraj2026'})
-    with zipfile.ZipFile(Path(root) / 'siraj_tables.zip') as archive:
-        with gzip.open(archive.open('tables/stable2.txt.gz'), 'rt') as stream:
-            sequences = pd.read_csv(stream, sep='\t')
-    sequences['variant_id'] = sequences.variant.str.removeprefix('chr')
-    sequences = sequences.drop_duplicates('variant_id')
-    frame = frame.merge(sequences[['variant_id', 'allele1_oligo', 'allele2_oligo']], on='variant_id', validate='one_to_one')
-    frame = add_sequences(frame, frame.allele1_oligo, frame.allele2_oligo).drop(columns=['allele1_oligo', 'allele2_oligo'])
-    frame['example_id'] = 'Siraj2026:' + frame.variant_id + ':' + source_context + ':' + target_context
-    return validate_frame(add_alleles(frame))
-
-
-def prepare_bourges(root, genome_build):
-    # Estimate paired donor activation effects from barcode counts without treating windows as donors.
-    raw = pd.read_csv(Path(root) / 'bourges_barcode_counts.txt.gz', sep='\t')
-    sample_cols = [f'{i}{s}' for i in range(1, 13) for s in ['U', 'S']] + [f'v{i}' for i in range(1, 5)]
-    library_sizes = raw[sample_cols].sum()
-    variants = raw[raw.rsID.fillna('').str.fullmatch(r'rs\d+')].copy()
-    variants['allele'] = variants.allele.astype(str).str.lower()
-    if not {'ref', 'alt'} <= set(variants.allele):
-        raise ValueError(f'Unsupported allele labels: {variants.allele.unique()}')
-    positive_controls = set(variants.loc[variants.elementID.astype(str).str.startswith('PosCtrl'), 'rsID'])
-    counts = variants.groupby(['rsID', 'elementTag', 'allele'])[sample_cols].sum()
-    scaled = counts.div(library_sizes, axis=1) * 1e6
-    dna = scaled[[f'v{i}' for i in range(1, 5)]].mean(axis=1)
-    # A declared 0.5 CPM pseudocount stabilizes a transparent exploratory estimator.
-    activity = np.log2((scaled[[f'{i}{s}' for i in range(1, 13) for s in ['U', 'S']]] + 0.5).div(dna + 0.5, axis=0))
-    effects = activity.xs('alt', level='allele') - activity.xs('ref', level='allele')
-    effects = effects.groupby(level='rsID').mean()
-    records = []
-    for rsid, row in effects.iterrows():
-        meta = variants[variants.rsID == rsid]
-        # Derive the SNP coordinate from the paired oligos rather than using a window start.
-        coordinates = []
-        for _, window in meta.groupby('elementTag'):
-            ref = window[window.allele == 'ref'].iloc[0]
-            alt = window[window.allele == 'alt'].iloc[0]
-            a, b = str(ref.genomicSequence).upper(), str(alt.genomicSequence).upper()
-            differences = [i for i, (x, y) in enumerate(zip(a, b)) if x != y]
-            match = re.fullmatch(r'(chr[^:]+):(\d+)-(\d+)', str(ref.localcoords))
-            if len(a) != len(b) or len(differences) != 1 or not match:
-                continue
-            offset = differences[0]
-            coordinates.append((match[1].removeprefix('chr'), int(match[2]) + offset, a[offset], b[offset]))
-        if not coordinates or len(set(coordinates)) != 1:
-            continue
-        chrom, position, ref, alt = coordinates[0]
-        source = row[[f'{i}U' for i in range(1, 13)]].to_numpy(float)
-        target = row[[f'{i}S' for i in range(1, 13)]].to_numpy(float)
-        if not np.isfinite(source).all() or not np.isfinite(target).all():
-            continue
-        records.append(dict(example_id=f'Bourges2020:{rsid}', variant_id=f'{chrom}:{position}:{ref}:{alt}',
-                            rsid=rsid, chrom=chrom, position=position, ref=ref, alt=alt, genome_build=genome_build,
-                            is_positive_control=rsid in positive_controls,
-                            source_context='primary_T_resting', target_context='primary_T_stimulated', dataset='Bourges2020',
-                            source_effect=source.mean(), target_effect=target.mean(),
-                            source_se=source.std(ddof=1) / np.sqrt(12), target_se=target.std(ddof=1) / np.sqrt(12),
-                            effect_covariance=np.cov(source, target, ddof=1)[0, 1] / 12))
-    return validate_frame(add_alleles(pd.DataFrame(records)))
-
-
-def feature_columns(frame, mode='full'):
-    # Return only explicit predictors, excluding identifiers and all target-derived fields.
-    allowed = BASE_FEATURES if mode == 'source_only' else ALLOWED_FEATURES
-    columns = [c for c in allowed if c in frame and frame[c].notna().any()]
-    if mode == 'no_source':
-        columns = [c for c in columns if c not in ['source_effect', 'source_se']]
-    if mode == 'no_context':
-        columns = [c for c in columns if c not in DHS]
-    return columns
-
-
-@dataclass(frozen=True)
-class DatasetAdapter:
-    # Describe an extraction function together with required files and supported options.
-    reader: object
-    inputs: tuple[str, ...]
-    options: tuple[str, ...] = ()
-    warnings: tuple[str, ...] = ()
-
-
-ADAPTERS = {
-    'ho': DatasetAdapter(prepare_ho, ('ho_supp.xlsx',), warnings=(
-        'Both primary-cell plasmid allele means must exceed 20, as specified in the publication.',
-        'Quantitative endpoint cohort; not a claim to reproduce the paper significant-variant count.',)),
-    'siraj': DatasetAdapter(prepare_siraj, ('siraj_MPRA.zip', 'siraj_tables.zip'),
-                           ('source_context', 'target_context', 'genome_build'), (
-        'Confirm declared genome build and allele orientation before cross-study evaluation.',
-        'Deterministic center/forward/reference-haplotype cohort; not the final publication cohort.')),
-    'bourges': DatasetAdapter(prepare_bourges, ('bourges_barcode_counts.txt.gz',), ('genome_build',), (
-        'Exploratory CPM/pseudocount estimator; not the original published count model.',
-        'Verify interval coordinate convention, genome build, orientation and rs-labelled controls.')),
-}
-
-
-@dataclass(frozen=True)
-class PreparedData:
-    # Return the canonical dataset, isolated predictor/target files and preparation audit.
-    dataset: Path
-    inputs: Path
-    targets: Path
-    report: Path
-    rows: int
-
-
-def prepare_dataset(dataset, root, output, source_context='K562', target_context='HepG2', genome_build='unverified'):
-    # Extract actual source files, validate the model schema and persist reproducible preparation artifacts.
-    adapter = ADAPTERS[dataset]
-    root, output = Path(root), Path(output)
-    missing = [name for name in adapter.inputs if not (root / name).is_file()]
-    if missing:
-        raise FileNotFoundError('Missing source data: ' + ', '.join(missing))
-    inputs = Path(str(output) + '.inputs.csv.gz')
-    targets = Path(str(output) + '.targets.csv.gz')
-    report_path = Path(str(output) + '.json')
-    source_shas = {name: sha256(root / name) for name in adapter.inputs}
-    source_build = declared_source_build(dataset, genome_build)
-    if all(p.is_file() for p in (output, inputs, targets, report_path)):
-        prior = json.loads(report_path.read_text())
-        prior_liftover = prior.get('liftover_to_grch38')
-        prior_liftover = prior_liftover if isinstance(prior_liftover, dict) else {}
-        # The cached contexts must match the requested ones, or changing the pair would silently reuse stale data.
-        requested_pair = {'source_context': source_context, 'target_context': target_context}
-        pair_matches = (not adapter.options
-                        or 'source_context' not in adapter.options
-                        or any({'source_context': p.get('source_context'),
-                                'target_context': p.get('target_context')} == requested_pair
-                               for p in prior.get('context_pairs') or ()))
-        if prior.get('status') == 'validated' \
-                and prior.get('source_files_sha256') == source_shas \
-                and prior.get('context_pairs') and prior.get('rows') and pair_matches \
-                and prior_liftover.get('version') == LIFTOVER_VERSION \
-                and prior_liftover.get('declared_source_build') == source_build:
-            print(f'Reusing prepared and validated {prior["rows"]:,} examples at {output}', flush=True)
-            return PreparedData(output, inputs, targets, report_path, int(prior['rows']))
-    options = dict(source_context=source_context, target_context=target_context, genome_build=genome_build)
-    raw = adapter.reader(root, **{name: options[name] for name in adapter.options})
-    # Lift from the declared source build and verify every row against the hg38 FASTA Decima reads.
-    raw, liftover_provenance = normalize_to_grch38(
-        raw, default_hg38_fasta(PROJECT_ROOT), default_chain_path(PROJECT_ROOT), source_build,
-        default_bourges_map(PROJECT_ROOT))
-    print(f'  liftover[{dataset}]: {liftover_provenance["normalized_rows"]}/'
-          f'{liftover_provenance["input_rows"]} variants verified against hg38 '
-          f'({liftover_provenance["dropped_rows"]} dropped: {liftover_provenance["dropped_reason_counts"]}); '
-          f'methods={liftover_provenance["mapping_method_counts"]}', flush=True)
-    frame = validate_frame(raw)
-    features = feature_columns(frame)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(output, index=False)
-    frame[['example_id'] + features].to_csv(inputs, index=False)
-    frame[['example_id'] + OUTCOMES].to_csv(targets, index=False)
-    write_json(report_path, {
-        'status': 'validated', 'dataset': dataset, 'rows': len(frame), 'unique_variants': frame.variant_id.nunique(),
-        'features': features, 'target_fields': OUTCOMES,
-        'liftover_to_grch38': liftover_provenance,
-        'feature_missing_fraction': frame[features].isna().mean().to_dict(),
-        'source_files_sha256': source_shas,
-        'prepared_files_sha256': {path.name: sha256(path) for path in [output, inputs, targets]},
-        'genome_build': frame.genome_build.unique().tolist(),
-        'context_pairs': frame[['source_context', 'target_context']].drop_duplicates().to_dict('records'),
-        'checks': {'unique_example_ids': True, 'finite_effects': True, 'positive_standard_errors': True,
-                   'valid_coordinates': True, 'valid_covariance': True, 'target_free_input_whitelist': True},
-        'warnings': list(adapter.warnings),
-        'preprocessing': 'Missing-value imputation and scaling are fitted only after training splits.',
-    })
-    print(f'Prepared and validated {len(frame):,} examples at {output}', flush=True)
-    return PreparedData(output, inputs, targets, report_path, len(frame))
-
-
-def main():
-    # Run the same extraction API independently when only prepared data is needed.
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--dataset', choices=list(ADAPTERS), default='ho')
-    parser.add_argument('--root', type=Path, default=PROJECT_ROOT / 'data' / 'regulatory_audit')
-    parser.add_argument('--output', type=Path, help='Prepared file; defaults to data/processed/<dataset>.csv.gz')
-    parser.add_argument('--source-context', default='K562')
-    parser.add_argument('--target-context', default='HepG2')
-    parser.add_argument('--genome-build', choices=['GRCh37', 'GRCh38', 'unverified'], default='unverified')
-    args = parser.parse_args()
-    output = args.output or PROJECT_ROOT / 'data' / 'processed' / f'{args.dataset}.csv.gz'
-    prepare_dataset(args.dataset, args.root, output, args.source_context, args.target_context, args.genome_build)
-
-
-SOURCE_COLUMNS = ['A_log2FC', 'B_log2FC', 'A_log2FC_SE', 'B_log2FC_SE']
-
-
-def numeric(frame, columns):
-    # Convert documented Excel missing cells while rejecting unexpected text.
-    return frame[columns].replace('#N/A', np.nan).apply(pd.to_numeric, errors='raise')
-
-_REPLICATE_CACHE = {}
-
-
-def merge_ho_replicate_quality(root, frame):
-    # Attach report-only replicate measurement quality from the GEO normalized counts; rep_ columns are never model inputs.
-    from .replicates import REPLICATE_COLUMNS, replicate_quality
-    path = Path(root) / 'ho_normalized_counts.txt.gz'
-    if not path.is_file():
-        raise FileNotFoundError(f'Missing Ho replicate counts: {path}')
-    if str(path) not in _REPLICATE_CACHE:
-        _REPLICATE_CACHE[str(path)] = replicate_quality(path)
-    table, provenance = _REPLICATE_CACHE[str(path)]
-    frame = frame.drop(columns=[c for c in REPLICATE_COLUMNS if c in frame], errors='ignore')
-    frame = frame.merge(table, on='variant_id', how='left', validate='many_to_one')
-    frame.attrs['replicate_quality_provenance'] = provenance
-    return frame
 
 
 def merge_ho_mechanistic_features(root, frame):
@@ -401,11 +119,8 @@ def merge_ho_mechanistic_features(root, frame):
         jurkat = read_sheet(workbook, '12. Jurkat motifbreakR results')
     finally:
         workbook.close()
-    annotations = annotations[['SNP19', 'delta_svm_nCD4'] + DHS].drop_duplicates('SNP19')
+    annotations = annotations[['SNP19', 'delta_svm_nCD4']].drop_duplicates('SNP19')
     annotations['delta_svm_nCD4'] = pd.to_numeric(annotations['delta_svm_nCD4'], errors='coerce')
-    for column in DHS:
-        annotations[column] = pd.to_numeric(annotations[column], errors='coerce').fillna(0)
-    frame = frame.drop(columns=[c for c in DHS if c in frame], errors='ignore')
     frame = frame.merge(annotations, left_on='variant_id', right_on='SNP19', how='left', validate='many_to_one').drop(columns='SNP19')
     for assay, sheet in [('tcell', tcell), ('jurkat', jurkat)]:
         sheet = sheet[['SNP19', 'geneSymbol', 'alleleDiff']].copy()
@@ -416,6 +131,4 @@ def merge_ho_mechanistic_features(root, frame):
                                 f'motifbreakr_{assay}_alleleDiff_min': grouped.alleleDiff.min(),
                                 f'motifbreakr_{assay}_tf_count': grouped.geneSymbol.nunique()}).reset_index()
         frame = frame.merge(summary, left_on='variant_id', right_on='SNP19', how='left', validate='many_to_one').drop(columns='SNP19')
-    for column in ['motifbreakr_tcell_tf_count', 'motifbreakr_jurkat_tf_count']:
-        frame[column] = frame[column].fillna(0)
     return frame
