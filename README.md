@@ -1,10 +1,12 @@
-# Assessment of regulatory variant effect prediction and uncertainty between Jurkat and primary CD4 T cells using a framework incorporating NeuroJico for expert review prioritization
+# Assessing uncertainty in regulatory effect transfer from Jurkat to primary CD4 T cells using NeuroJico principles
 
 ## Summary
 
 We developed a computational framework to evaluate how well regulatory variant effects measured in Jurkat cells predict allelic effects in activated primary CD4 T cells. It uses published MPRA data, strong source-only references, molecular annotations, genomic locus separation, and explicit usefulness criteria. The framework creates an outcome-blind queue of variants for review and reports prediction error among retained estimates. Expert corrections and human benefit are not assumed.
 
-The conceptual foundation is Hassanien’s NeuroSophic cognition model, which connects NeuroJico philosophy with uncertainty representation and human cognitive autonomy. Our framework incorporates NeuroJico principles by retaining evidence for human judgement when immune regulatory variant predictions are uncertain. [Hassanien (2025)](https://doi.org/10.33168/JLISS.2025.1110).
+NeuroJico is a philosophy concerned with human cognition and autonomy in interactions with intelligent systems. Its concept of cognitive sovereignty emphasizes retaining control over judgement when using computational assistance. We apply this principle by preserving the evidence behind each review recommendation. The research gap is how to connect uncertain Jurkat-to-primary-CD4 predictions to justified review priorities. [Hassanien (2025)](https://doi.org/10.33168/JLISS.2025.1110).
+
+Hassanien and Askr applied cognitive sovereignty to adaptive engineering optimization. Askr and colleagues drew on cognitive justice when interpreting class representation in brain tumor classification. Our framework brings these concerns about evidence and judgement to immune regulatory genomics. [Hassanien and Askr (2026)](https://doi.org/10.1016/j.sciaf.2026.e03539), [Askr et al. (2026)](https://doi.org/10.1007/s44196-026-01376-y).
 
 The evaluated cohort contains 18,134 variants across 322 locus groups. Molecular features did not meet the criterion of at least 5% lower prediction MSE than the strongest source-only reference. Rough-set prioritization also failed to improve retained error over the selected ordinary selector. These results support an evidence-based benchmark of model limitations and review prioritization.
 
@@ -121,7 +123,7 @@ The manuscript is a draft and has no assigned journal citation or DOI. Cite the 
 
 ```bibtex
 @software{regulatory_variant_framework,
-  title = {Assessment of regulatory variant effect prediction and uncertainty between Jurkat and primary CD4 T cells using a framework incorporating NeuroJico for expert review prioritization},
+  title = {Assessing uncertainty in regulatory effect transfer from Jurkat to primary CD4 T cells using NeuroJico principles},
   url = {https://github.com/Moustafazn/regulatory-variant-framework}
 }
 ```

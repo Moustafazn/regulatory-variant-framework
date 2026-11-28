@@ -52,7 +52,7 @@ def platform_metadata():
 
 
 
-PAPER_TITLE = 'Uncertainty-Aware Regulatory Variant Interpretation in Immune Cells: Linking Automated Prediction to Expert Review'
+PAPER_TITLE = 'Assessing uncertainty in regulatory effect transfer from Jurkat to primary CD4 T cells using NeuroJico principles'
 INK, BLUE, ORANGE, TEAL, PURPLE = '#16354A', '#176B96', '#C77829', '#318B84', '#7956A8'
 GRAY, GRID = '#87949D', '#E2E8ED'
 METHOD_LABELS = {
